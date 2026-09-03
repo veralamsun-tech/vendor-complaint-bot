@@ -236,10 +236,10 @@ async function handleUser(ev) {
 
   // 通用指令
   if (msgText === '#我的ID') return [text(`你的 LINE ID：\n${userId}`)];
-  if (msgText === '#取消') {
+  if (msgText === '#取消' || msgText === '取消') {
     if (!s) return [];
     clearSession(userId);
-    return [text('已取消。')];
+    return [text('已取消，這次反應不會送出。')];
   }
 
   // 採購在一對一也可以下指令
@@ -265,7 +265,7 @@ async function handleUser(ev) {
     const chef = await getChef(userId);
     if (!chef) return startRegistration(userId);
     setSession(userId, newComplaint());
-    return [text('好的，請把「廠商名＋問題描述」和「1-3 張照片」傳給我。\n例如：ＸＸ（廠商）的ＸＸ（商品）不新鮮，很多都爛了\n\n（想放棄請輸入 #取消）')];
+    return [text('好的，請把「廠商名＋問題描述」和「1-3 張照片」傳給我。\n例如：ＸＸ（廠商）的ＸＸ（商品）不新鮮，很多都爛了\n\n📌 中途想放棄，請輸入【取消】')];
   }
   if (msgText === '#我的案件') {
     const { cases } = await gas('getOpenCases');
@@ -301,7 +301,7 @@ async function handleRegistration(ev, userId, s, msgText, pbData) {
     await gas('registerChef', { userId, name, venue: s.venue });
     cache.chef.delete(userId);
     setSession(userId, newComplaint());
-    return [text(`設定完成！${s.venue} ${name} 師傅你好。\n\n現在請把「廠商名＋問題描述」和「1-3 張照片」傳給我，例如：\nＸＸ（廠商）的ＸＸ（商品）不新鮮，很多都爛了（＋照片）\n\n以後要反映時，先輸入「NG商品」我就會出來。`)];
+    return [text(`設定完成！${s.venue} ${name} 師傅你好。\n\n現在請把「廠商名＋問題描述」和「1-3 張照片」傳給我，例如：\nＸＸ（廠商）的ＸＸ（商品）不新鮮，很多都爛了（＋照片）\n\n📌 小提醒\n1. 如需反應廠商/食品問題，請先輸入【NG商品】\n2. 中途想放棄，請輸入【取消】`)];
   }
   return [];
 }
@@ -320,7 +320,7 @@ async function handleComplaint(ev, userId, chef, s, msgText, isImage, pbData) {
 
   // 確認卡的按鈕
   if (pbData) {
-    if (pbData.a === 'cancel') { clearSession(userId); return [text('已取消，這次反映不會送出。')]; }
+    if (pbData.a === 'cancel') { clearSession(userId); return [text('已取消，這次反應不會送出。')]; }
     if (pbData.a === 'edit') { setSession(userId, newComplaint()); return [text('好，請重新傳一次「廠商名＋問題」和照片。')]; }
     if (pbData.a === 'vendor') {
       s.vendor = pbData.v; s.vendorUnconfirmed = false; s.stage = 'collect'; setSession(userId, s);
@@ -447,9 +447,9 @@ async function handleGroup(ev) {
   const s = getSession(userId);
 
   // 結案中：這句話就是處理結果
-  if (admin && s && s.stage === 'closing' && msgText && !msgText.startsWith('#')) {
-    clearSession(userId);
-    return closeCase(s.caseId, admin, msgText);
+  if (admin && s && s.stage === 'closing' && msgText) {
+    if (msgText === '取消' || msgText === '#取消') { clearSession(userId); return [text('已取消結案。')]; }
+    if (!msgText.startsWith('#')) { clearSession(userId); return closeCase(s.caseId, admin, msgText); }
   }
 
   if (pbData) {
@@ -463,7 +463,7 @@ async function handleGroup(ev) {
     }
     if (pbData.a === 'close') {
       setSession(userId, { stage: 'closing', caseId: pbData.id });
-      return [text(`${admin['姓名']}，請直接輸入案件 ${pbData.id} 的處理結果（例如：廠商同意明日補貨 2 箱）。\n輸入 #取消 可放棄。`)];
+      return [text(`${admin['姓名']}，請直接輸入案件 ${pbData.id} 的處理結果（例如：廠商同意明日補貨 2 箱）。\n輸入【取消】可放棄。`)];
     }
     return [];
   }
