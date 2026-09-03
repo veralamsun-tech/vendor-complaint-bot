@@ -1,0 +1,16 @@
+{
+  "name": "vendor-complaint-bot",
+  "version": "1.0.0",
+  "description": "典華 採購LINE@ 廠商反映機器人",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "@line/bot-sdk": "^7.7.0",
+    "express": "^4.19.2"
+  }
+}
