@@ -265,7 +265,7 @@ async function handleUser(ev) {
     const chef = await getChef(userId);
     if (!chef) return startRegistration(userId);
     setSession(userId, newComplaint());
-    return [text('好的，請把「廠商名＋問題描述」和「1-3 張照片」傳給我。\n例如：富裕的蛋都破了\n\n（想放棄請輸入 #取消）')];
+    return [text('好的，請把「廠商名＋問題描述」和「1-3 張照片」傳給我。\n例如：ＸＸ（廠商）的ＸＸ（商品）不新鮮，很多都爛了\n\n（想放棄請輸入 #取消）')];
   }
   if (msgText === '#我的案件') {
     const { cases } = await gas('getOpenCases');
@@ -301,7 +301,7 @@ async function handleRegistration(ev, userId, s, msgText, pbData) {
     await gas('registerChef', { userId, name, venue: s.venue });
     cache.chef.delete(userId);
     setSession(userId, newComplaint());
-    return [text(`設定完成！${s.venue} ${name} 師傅你好。\n\n現在請把「廠商名＋問題描述」和「1-3 張照片」傳給我，例如：\n富裕的蛋都破了（＋照片）\n\n以後要反映時，先輸入「NG商品」我就會出來。`)];
+    return [text(`設定完成！${s.venue} ${name} 師傅你好。\n\n現在請把「廠商名＋問題描述」和「1-3 張照片」傳給我，例如：\nＸＸ（廠商）的ＸＸ（商品）不新鮮，很多都爛了（＋照片）\n\n以後要反映時，先輸入「NG商品」我就會出來。`)];
   }
   return [];
 }
@@ -378,7 +378,7 @@ function askPick(userId, s, hits) {
 function nextStep(userId, s, venue, prefix) {
   if (!s.description && !s.vendor && !s.vendorText) {
     s.stage = 'collect'; setSession(userId, s);
-    return [text(`${prefix}\n請用文字說明一下：哪一家廠商、什麼問題？\n例如：富裕的蛋都破了`)];
+    return [text(`${prefix}\n請用文字說明一下：哪一家廠商、什麼問題？\n例如：ＸＸ（廠商）的ＸＸ（商品）不新鮮，很多都爛了`)];
   }
   if (!s.vendor && !s.vendorText) {
     s.stage = 'ask_vendor'; setSession(userId, s);
@@ -386,7 +386,7 @@ function nextStep(userId, s, venue, prefix) {
   }
   if (!s.description) {
     s.stage = 'collect'; setSession(userId, s);
-    return [text(`${prefix}\n請簡單描述一下問題（例如：蛋都破了、少送兩箱）。`)];
+    return [text(`${prefix}\n請簡單描述一下問題（例如：不新鮮很多都爛了、少送兩箱）。`)];
   }
   if (s.photos.length === 0) {
     s.stage = 'collect'; setSession(userId, s);
@@ -463,7 +463,7 @@ async function handleGroup(ev) {
     }
     if (pbData.a === 'close') {
       setSession(userId, { stage: 'closing', caseId: pbData.id });
-      return [text(`${admin['姓名']}，請直接輸入案件 ${pbData.id} 的處理結果（例如：富裕明日補 20 顆）。\n輸入 #取消 可放棄。`)];
+      return [text(`${admin['姓名']}，請直接輸入案件 ${pbData.id} 的處理結果（例如：廠商同意明日補貨 2 箱）。\n輸入 #取消 可放棄。`)];
     }
     return [];
   }
@@ -487,7 +487,7 @@ async function handleAdminCommand(msgText, admin, userId) {
   }
   if (cmd === '#結案') {
     const [id, ...res] = rest;
-    if (!id || !res.length) return [text('格式：#結案 案件編號 處理結果\n例如：#結案 20260904-01 富裕明日補20顆')];
+    if (!id || !res.length) return [text('格式：#結案 案件編號 處理結果\n例如：#結案 20260904-01 廠商同意明日補貨2箱')];
     return closeCase(id, admin, res.join(' '));
   }
   if (cmd === '#廠商') {
