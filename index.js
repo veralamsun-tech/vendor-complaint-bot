@@ -503,8 +503,19 @@ async function handleAdminCommand(msgText, admin, userId) {
     if (!c) return [text('找不到這個案件。')];
     return [caseFlex(c, { title: '📄 案件' })];
   }
+  if (cmd === '#開單') {
+    const q = rest.join(' ').trim();
+    if (!q) return [text('格式：#開單 師傅名字\n例如：#開單 慶哥')];
+    const { chefs } = await gas('findChefs', { name: q });
+    if (!chefs.length) return [text(`找不到叫「${q}」的師傅。師傅要先跟 LINE@ 打過「NG商品」完成設定，名單裡才有他。`)];
+    if (chefs.length > 1) return [text('找到多位，請打更完整的名字：\n' + chefs.map(c => `${c['館別']} ${c['姓名']}`).join('\n'))];
+    const chef = chefs[0];
+    setSession(chef['LINE ID'], newComplaint());
+    await safePush(chef['LINE ID'], [text(`採購 ${admin['姓名']} 幫你開了 NG商品 反應流程。\n請把「廠商名＋問題描述」和「1-3 張照片」傳給我，例如：\nＸＸ（廠商）的ＸＸ（商品）不新鮮，很多都爛了\n\n📌 中途想放棄，請輸入【取消】`)]);
+    return [text(`✅ 已請 ${chef['館別']} ${chef['姓名']} 師傅傳送反應內容。`)];
+  }
   if (cmd === '#說明') {
-    return [text('採購指令：\n#未結案 — 列出未結案\n#案件 編號 — 查看案件\n#結案 編號 處理結果 — 結案\n#廠商 編號 正確廠商名 — 修正廠商\n#設定採購群 — 把目前群組設為通知群\n#我是採購 名字 — 登記為採購')];
+    return [text('採購指令：\n#未結案 — 列出未結案\n#案件 編號 — 查看案件\n#結案 編號 處理結果 — 結案\n#廠商 編號 正確廠商名 — 修正廠商\n#開單 師傅名字 — 幫師傅開啟反應流程\n#設定採購群 — 把目前群組設為通知群\n#我是採購 名字 — 登記為採購')];
   }
   return null;
 }
