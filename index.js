@@ -19,6 +19,7 @@ const VENUES = ['大直館', '新莊館', '士林館'];
 const CATEGORIES = ['品質不良', '數量短少', '送錯品項', '逾時送達', '其他'];
 const BRAND = '#968571';
 const MAX_PHOTOS = 3;
+const TRIGGERS = ['NG商品', 'ng商品', 'Ng商品', '#NG商品', '#ng商品', 'NG 商品', 'ng 商品'];
 
 const client = new line.Client(config);
 const app = express();
@@ -226,64 +227,51 @@ async function handleBatch(events) {
 // ============================================================
 async function handleUser(ev) {
   const userId = ev.source.userId;
-
-  if (ev.type === 'follow') {
-    clearSession(userId);
-    return startRegistration(userId);
-  }
   if (ev.type !== 'message' && ev.type !== 'postback') return [];
 
   const msgText = ev.type === 'message' && ev.message.type === 'text' ? ev.message.text.trim() : null;
   const isImage = ev.type === 'message' && ev.message.type === 'image';
   const pbData = ev.type === 'postback' ? parsePb(ev.postback.data) : null;
+  const s = getSession(userId);
 
   // 通用指令
   if (msgText === '#我的ID') return [text(`你的 LINE ID：\n${userId}`)];
-  if (msgText === '#取消') { clearSession(userId); return [text('已取消。')]; }
+  if (msgText === '#取消') {
+    if (!s) return [];
+    clearSession(userId);
+    return [text('已取消。')];
+  }
 
   // 採購在一對一也可以下指令
-  const admin = await getAdmin(userId);
-  if (admin && msgText && msgText.startsWith('#')) {
-    const r = await handleAdminCommand(msgText, admin, userId);
-    if (r) return r;
+  if (msgText && msgText.startsWith('#')) {
+    const admin = await getAdmin(userId);
+    if (admin) {
+      const r = await handleAdminCommand(msgText, admin, userId);
+      if (r) return r;
+    }
   }
 
-  // 註冊流程
-  let chef = await getChef(userId);
-  const s = getSession(userId);
-  if (!chef) {
-    if (!s || !s.stage.startsWith('reg_')) return startRegistration(userId);
-    return handleRegistration(ev, userId, s, msgText, pbData);
+  // 進行中的流程：註冊或反映
+  if (s) {
+    if (s.stage.startsWith('reg_')) return handleRegistration(ev, userId, s, msgText, pbData);
+    const chef = await getChef(userId);
+    if (chef) return handleComplaint(ev, userId, chef, s, msgText, isImage, pbData);
+    clearSession(userId);
+    return [];
   }
 
-  // 反映流程中的 postback / 文字 / 圖片
-  if (s && ['collect', 'ask_vendor', 'pick_vendor', 'confirm'].includes(s.stage)) {
-    return handleComplaint(ev, userId, chef, s, msgText, isImage, pbData);
-  }
-
-  if (msgText === '#反映' || msgText === '反映' || msgText === '反應') {
+  // 沒有進行中的流程：只認觸發字，其他一律不理（讓採購正常聊天）
+  if (msgText && TRIGGERS.includes(msgText)) {
+    const chef = await getChef(userId);
+    if (!chef) return startRegistration(userId);
     setSession(userId, newComplaint());
-    return [text('好的，請把「廠商名＋問題描述」和「1-3 張照片」傳給我。\n例如：富裕的蛋都破了')];
+    return [text('好的，請把「廠商名＋問題描述」和「1-3 張照片」傳給我。\n例如：富裕的蛋都破了\n\n（想放棄請輸入 #取消）')];
   }
   if (msgText === '#我的案件') {
     const { cases } = await gas('getOpenCases');
     const mine = cases.filter(c => c['師傅LINE ID'] === userId);
     if (!mine.length) return [text('你目前沒有未結案的反映。')];
     return [text('你目前未結案的反映：\n' + mine.map(c => `${c['案件編號']}｜${c['廠商']}｜${c['狀態']}${c['負責人'] ? '（' + c['負責人'] + '）' : ''}`).join('\n'))];
-  }
-
-  // 沒有進行中的對話：看看有沒有未結案 → 當作補充；否則開新反映
-  if (msgText || isImage) {
-    const { case: open } = await gas('getOpenCaseByChef', { chefId: userId });
-    if (open) {
-      if (msgText) {
-        await gas('addNote', { caseId: open['案件編號'], operator: chef['姓名'], note: msgText });
-        return [text(`已補充到案件 ${open['案件編號']}，採購會看到。\n如果是另一件新的問題，請先輸入「#反映」。`)];
-      }
-      return [text(`照片已收到，採購會在對話中看到。\n如果是另一件新的問題，請先輸入「#反映」。`)];
-    }
-    const ns = setSession(userId, newComplaint());
-    return handleComplaint(ev, userId, chef, ns, msgText, isImage, pbData);
   }
   return [];
 }
@@ -312,8 +300,8 @@ async function handleRegistration(ev, userId, s, msgText, pbData) {
     if (!name) return [text('請輸入你的名字。')];
     await gas('registerChef', { userId, name, venue: s.venue });
     cache.chef.delete(userId);
-    clearSession(userId);
-    return [text(`設定完成！${s.venue} ${name} 師傅你好。\n\n以後要反映廠商問題，直接傳「廠商名＋問題」和照片給我就可以，例如：\n富裕的蛋都破了（＋照片）`)];
+    setSession(userId, newComplaint());
+    return [text(`設定完成！${s.venue} ${name} 師傅你好。\n\n現在請把「廠商名＋問題描述」和「1-3 張照片」傳給我，例如：\n富裕的蛋都破了（＋照片）\n\n以後要反映時，先輸入「NG商品」我就會出來。`)];
   }
   return [];
 }
@@ -424,7 +412,7 @@ async function submitCase(userId, chef, s) {
     const { admins } = await gas('getAdmins');
     for (const a of admins) await safePush(a['LINE ID'], [caseFlex(c)]);
   }
-  return [text(`✅ 已建立案件 ${caseId}，採購已收到通知，處理進度會再回報你。\n\n如果採購有問題會直接在這裡問你，直接回覆就好。`)];
+  return [text(`✅ 已建立案件 ${caseId}，採購已收到通知，處理進度會再回報你。\n\n採購如果有問題會直接在這裡問你，正常回覆就好。`)];
 }
 
 // ============================================================
