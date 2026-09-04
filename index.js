@@ -19,7 +19,13 @@ const VENUES = ['大直館', '新莊館', '士林館'];
 const CATEGORIES = ['品質不良', '數量短少', '送錯品項', '逾時送達', '其他'];
 const BRAND = '#968571';
 const MAX_PHOTOS = 3;
-const TRIGGERS = ['NG商品', 'ng商品', 'Ng商品', '#NG商品', '#ng商品', 'NG 商品', 'ng 商品'];
+// 訊息開頭是 NG商品（不分大小寫、可有#、可有空格）就觸發，後面的字當作問題描述
+function matchTrigger(t) {
+  if (!t) return null;
+  const m = t.match(/^[#＃]?\s*[nNｎＮ][gGｇＧ]\s*商品[\s，,：:、。]*/);
+  if (!m) return null;
+  return t.slice(m[0].length).trim(); // 剩下的文字
+}
 
 const client = new line.Client(config);
 const app = express();
@@ -261,10 +267,12 @@ async function handleUser(ev) {
   }
 
   // 沒有進行中的流程：只認觸發字，其他一律不理（讓採購正常聊天）
-  if (msgText && TRIGGERS.includes(msgText)) {
+  const rest = matchTrigger(msgText);
+  if (rest !== null) {
     const chef = await getChef(userId);
     if (!chef) return startRegistration(userId);
-    setSession(userId, newComplaint());
+    const ns = setSession(userId, newComplaint());
+    if (rest) return handleComplaint(ev, userId, chef, ns, rest, false, null);
     return [text('好的，請把「廠商名＋問題描述」和「1-3 張照片」傳給我。\n例如：ＸＸ（廠商）的ＸＸ（商品）不新鮮，很多都爛了\n\n📌 中途想放棄，請輸入【取消】')];
   }
   if (msgText === '#我的案件') {
