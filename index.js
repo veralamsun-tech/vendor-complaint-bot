@@ -439,12 +439,14 @@ async function handleGroup(ev) {
   if (!userId) return [];
 
   // 登記與設定
-  if (msgText === '#設定採購群') {
+  const normalized = msgText ? msgText.replace(/^[#＃]\s*/, '#') : null;
+  if (normalized === '#設定採購群' || normalized === '設定採購群') {
     await gas('setConfig', { key: '採購群ID', value: groupId });
     return [text('✅ 已將這個群設為採購案件通知群。')];
   }
-  if (msgText && msgText.startsWith('#我是採購')) {
-    const name = msgText.replace('#我是採購', '').trim();
+  const regMatch = normalized && normalized.match(/^#?我是採購\s*(.*)$/);
+  if (regMatch) {
+    const name = regMatch[1].trim();
     if (!name) return [text('請在後面加上名字，例如：#我是採購 小美')];
     await gas('registerAdmin', { userId, name });
     cache.admin.delete(userId);
