@@ -1,7 +1,7 @@
 // ============================================================
-//  典華 採購LINE@ 廠商反映機器人
-//  環境變數：LINE_CHANNEL_SECRET, LINE_CHANNEL_ACCESS_TOKEN,
-//            GAS_URL, GAS_KEY, GEMINI_API_KEY
+//  典華 採購LINE@ 廠商反映機器人 (v2)
+//  師傅照平常傳訊息；採購用 #開單 建案；預覽卡在採購群確認
+//  環境變數：LINE_CHANNEL_SECRET, LINE_CHANNEL_ACCESS_TOKEN, GAS_URL, GAS_KEY
 // ============================================================
 const express = require('express');
 const line = require('@line/bot-sdk');
@@ -12,39 +12,61 @@ const config = {
 };
 const GAS_URL = process.env.GAS_URL;
 const GAS_KEY = process.env.GAS_KEY;
-const GEMINI_KEY = process.env.GEMINI_API_KEY;
-const GEMINI_MODEL = 'gemini-2.0-flash-lite';
 
-const VENUES = ['大直館', '新莊館', '士林館'];
-const CATEGORIES = ['品質不良', '數量短少', '送錯品項', '逾時送達', '其他'];
 const BRAND = '#968571';
-const MAX_PHOTOS = 3;
-// 訊息開頭是 NG商品（不分大小寫、可有#、可有空格）就觸發，後面的字當作問題描述
-function matchTrigger(t) {
-  if (!t) return null;
-  const m = t.match(/^[#＃]?\s*[nNｎＮ][gGｇＧ]\s*商品[\s，,：:、。]*/);
-  if (!m) return null;
-  return t.slice(m[0].length).trim(); // 剩下的文字
-}
+const VENUES = ['大直館', '新莊館', '士林館'];
+const MAX_PHOTOS = 5;
+const WINDOW_MS = 10 * 60 * 1000;        // #開單 抓師傅最近 10 分鐘
+const QUOTE_WINDOW_MS = 3 * 60 * 1000;   // 引用時抓前後 3 分鐘
+const BUFFER_TTL = 30 * 60 * 1000;       // 訊息暫存 30 分鐘後丟掉
+const DRAFT_TTL = 30 * 60 * 1000;        // 預覽 30 分鐘未確認作廢
+const NG_DEBOUNCE_MS = 60 * 1000;        // 師傅打 NG 後等 60 秒再出預覽
+const CACHE_TTL = 10 * 60 * 1000;
 
 const client = new line.Client(config);
 const app = express();
 
-// ---------- 記憶體暫存 ----------
-const sessions = new Map();          // userId -> 對話狀態
-const cache = { chef: new Map(), admin: new Map(), vendors: null, vendorsAt: 0 };
-const SESSION_TTL = 30 * 60 * 1000;
-const CACHE_TTL = 10 * 60 * 1000;
+// ============================================================
+//  記憶體：訊息暫存 / 預覽草稿 / 快取
+// ============================================================
+const buffers = new Map();     // userId -> [{ts, type, text, messageId, chatId, chatType}]
+const drafts = new Map();      // draftId -> draft
+let lastDraftId = null;
+const ngTimers = new Map();    // userId -> timeout
+const nameCache = new Map();   // chatId:userId -> {name, at}
+const cache = { vendors: null, vendorsAt: 0, chefs: null, chefsAt: 0, admins: new Map(), groups: null, groupsAt: 0 };
 
-function getSession(id) {
-  const s = sessions.get(id);
-  if (s && Date.now() - s.updated > SESSION_TTL) { sessions.delete(id); return null; }
-  return s || null;
+function remember(ev) {
+  const userId = ev.source.userId;
+  if (!userId || ev.type !== 'message') return;
+  const m = ev.message;
+  if (m.type !== 'text' && m.type !== 'image') return;
+  const chatType = ev.source.type;
+  const chatId = chatType === 'group' ? ev.source.groupId : chatType === 'room' ? ev.source.roomId : userId;
+  const list = buffers.get(userId) || [];
+  list.push({ ts: ev.timestamp || Date.now(), type: m.type, text: m.type === 'text' ? m.text : '', messageId: m.id, chatId, chatType });
+  buffers.set(userId, list.slice(-40));
 }
-function setSession(id, s) { s.updated = Date.now(); sessions.set(id, s); return s; }
-function clearSession(id) { sessions.delete(id); }
+setInterval(() => {
+  const cutoff = Date.now() - BUFFER_TTL;
+  for (const [uid, list] of buffers) {
+    const kept = list.filter(i => i.ts >= cutoff);
+    if (kept.length) buffers.set(uid, kept); else buffers.delete(uid);
+  }
+  for (const [id, d] of drafts) if (Date.now() - d.createdAt > DRAFT_TTL) drafts.delete(id);
+}, 60 * 1000);
 
-// ---------- Google Apps Script ----------
+function findBufferedMessage(messageId) {
+  for (const [uid, list] of buffers) {
+    const item = list.find(i => i.messageId === messageId);
+    if (item) return { userId: uid, item };
+  }
+  return null;
+}
+
+// ============================================================
+//  Google Apps Script
+// ============================================================
 async function gas(action, data) {
   const r = await fetch(GAS_URL, {
     method: 'POST',
@@ -56,113 +78,202 @@ async function gas(action, data) {
   if (!j.ok) throw new Error(j.error || 'GAS error');
   return j;
 }
-async function getChef(userId) {
-  const c = cache.chef.get(userId);
-  if (c && Date.now() - c.at < CACHE_TTL) return c.v;
-  const { chef } = await gas('getChef', { userId });
-  cache.chef.set(userId, { v: chef, at: Date.now() });
-  return chef;
-}
-async function getAdmin(userId) {
-  const c = cache.admin.get(userId);
-  if (c && Date.now() - c.at < CACHE_TTL) return c.v;
-  const { admin } = await gas('getAdmin', { userId });
-  cache.admin.set(userId, { v: admin, at: Date.now() });
-  return admin;
-}
-async function getVendors() {
-  if (cache.vendors && Date.now() - cache.vendorsAt < CACHE_TTL) return cache.vendors;
+async function getVendors(force) {
+  if (!force && cache.vendors && Date.now() - cache.vendorsAt < CACHE_TTL) return cache.vendors;
   const { vendors } = await gas('getVendors');
   cache.vendors = vendors; cache.vendorsAt = Date.now();
   return vendors;
 }
-
-// ---------- 廠商比對 ----------
-function norm(s) { return String(s || '').replace(/\s/g, '').toLowerCase(); }
-function matchVendors(text, vendors) {
-  const t = norm(text);
-  if (!t) return [];
-  const exact = vendors.filter(v => norm(v.name) === t || v.aliases.some(a => norm(a) === t));
-  if (exact.length) return exact.map(v => v.name);
-  const partial = vendors.filter(v =>
-    norm(v.name).includes(t) || t.includes(norm(v.name)) ||
-    v.aliases.some(a => norm(a).includes(t) || t.includes(norm(a))));
-  return partial.map(v => v.name);
+async function getChefs(force) {
+  if (!force && cache.chefs && Date.now() - cache.chefsAt < CACHE_TTL) return cache.chefs;
+  const { chefs } = await gas('getChefs');
+  cache.chefs = chefs; cache.chefsAt = Date.now();
+  return chefs;
+}
+async function getAdmin(userId) {
+  const c = cache.admins.get(userId);
+  if (c && Date.now() - c.at < CACHE_TTL) return c.v;
+  const { admin } = await gas('getAdmin', { userId });
+  cache.admins.set(userId, { v: admin, at: Date.now() });
+  return admin;
+}
+async function getGroups(force) {
+  if (!force && cache.groups && Date.now() - cache.groupsAt < CACHE_TTL) return cache.groups;
+  const { groups, purchasingGroupId } = await gas('getGroups');
+  cache.groups = { venues: groups, purchasingGroupId }; cache.groupsAt = Date.now();
+  return cache.groups;
 }
 
-// ---------- Gemini：抽出廠商 / 描述 / 分類 ----------
-async function analyze(text, vendors) {
-  const fallback = { vendor_match: null, vendor_text: null, description: text, category: '其他' };
-  if (!GEMINI_KEY) return fallback;
-  const names = vendors.map(v => v.name).join('、');
-  const prompt = `你是餐飲公司採購助理。廚師傳來一則反映廠商送貨問題的訊息，請抽出資訊並只回傳 JSON。
-廠商清單：${names}
-分類只能選：${CATEGORIES.join('、')}
-規則：
-- vendor_match：訊息中提到的廠商若能對應到清單中的某一家（允許簡稱、錯字），填清單中的完整名稱；否則 null。
-- vendor_text：訊息中原本寫的廠商名稱文字；沒提到廠商就 null。
-- description：把廠商名去掉後，剩下的問題描述，保留原意，簡短。
-- category：最接近的分類。
-訊息：「${text}」
-JSON 格式：{"vendor_match":..., "vendor_text":..., "description":..., "category":...}`;
-  try {
-    const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_KEY}`, {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }], generationConfig: { responseMimeType: 'application/json', temperature: 0 } }),
-    });
-    const j = await r.json();
-    const raw = j.candidates?.[0]?.content?.parts?.[0]?.text || '';
-    const out = JSON.parse(raw.replace(/```json|```/g, '').trim());
-    if (out.vendor_match && !vendors.some(v => v.name === out.vendor_match)) out.vendor_match = null;
-    if (!CATEGORIES.includes(out.category)) out.category = '其他';
-    if (!out.description) out.description = text;
-    return out;
-  } catch (e) {
-    console.error('Gemini error', e);
-    return fallback;
-  }
-}
-
-// ---------- LINE 小工具 ----------
+// ============================================================
+//  小工具
+// ============================================================
 function text(t) { return { type: 'text', text: t }; }
-function quick(t, items) {
-  return { type: 'text', text: t, quickReply: { items: items.map(i => ({ type: 'action', action: i })) } };
-}
 function pb(label, data) { return { type: 'postback', label: label.slice(0, 20), data, displayText: label.slice(0, 20) }; }
 function parsePb(data) { return Object.fromEntries(new URLSearchParams(data)); }
+function norm(s) { return String(s || '').replace(/[\s\u3000]/g, '').toLowerCase(); }
+function hhmm(ts) { return new Date(ts + 8 * 3600 * 1000).toISOString().slice(11, 16); }
+async function safePush(to, msgs) {
+  try { await client.pushMessage(to, msgs); } catch (e) { console.error('push error', e.originalError?.response?.data || e.message); }
+}
 async function downloadImage(messageId) {
   const stream = await client.getMessageContent(messageId);
   const chunks = [];
   for await (const c of stream) chunks.push(c);
   return Buffer.concat(chunks).toString('base64');
 }
-async function safePush(to, msgs) {
-  try { await client.pushMessage(to, msgs); } catch (e) { console.error('push error', e.originalError?.response?.data || e.message); }
+async function displayNameOf(userId, chatId, chatType) {
+  const key = chatId + ':' + userId;
+  const c = nameCache.get(key);
+  if (c && Date.now() - c.at < CACHE_TTL) return c.name;
+  let name = '';
+  try {
+    if (chatType === 'group') name = (await client.getGroupMemberProfile(chatId, userId)).displayName;
+    else if (chatType === 'room') name = (await client.getRoomMemberProfile(chatId, userId)).displayName;
+    else name = (await client.getProfile(userId)).displayName;
+  } catch (e) { name = ''; }
+  nameCache.set(key, { name, at: Date.now() });
+  return name;
+}
+// 「新莊/雅聚中廚砧板頭/周振揚」→ { name: 周振揚, venue: 新莊館 }
+function parseDisplayName(dn) {
+  const parts = String(dn || '').split(/[\/／|｜]/).map(s => s.trim()).filter(Boolean);
+  const name = parts.length ? parts[parts.length - 1] : String(dn || '');
+  let venue = '';
+  for (const v of VENUES) if (String(dn || '').includes(v.replace('館', ''))) { venue = v; break; }
+  return { name, venue };
 }
 
-function confirmFlex(s, venue) {
+// 指令解析：訊息任何位置出現 #指令 都算，其餘文字切成 tokens
+const COMMANDS = ['開單', '刪照片', '取消', '作廢', '未結案', '案件', '結案', '廠商', '說明', '設定採購群', '設定館別', '我是採購', '我的ID', '確認'];
+function parseCommand(t) {
+  if (!t) return null;
+  const s = t.replace(/\u3000/g, ' ');
+  const re = new RegExp('[#＃]\\s*(' + COMMANDS.join('|') + ')');
+  const m = s.match(re);
+  if (!m) {
+    if (/^\s*取消\s*$/.test(s)) return { cmd: '取消', tokens: [], rest: '' };
+    return null;
+  }
+  const rest = (s.slice(0, m.index) + ' ' + s.slice(m.index + m[0].length)).replace(/[「」【】\[\]（）()]/g, ' ');
+  const tokens = rest.split(/\s+/).map(x => x.trim()).filter(Boolean);
+  return { cmd: m[1], tokens, rest: tokens.join(' ') };
+}
+// 師傅訊息開頭是 NG（寬鬆）
+function isNgMessage(t) {
+  return /^[\s「」【】\[\]（）()#＃]*[nNｎＮ][gGｇＧ]/.test(String(t || ''));
+}
+
+// ============================================================
+//  比對：廠商 / 師傅
+// ============================================================
+function matchVendor(token, vendors) {
+  const t = norm(token);
+  if (t.length < 2) return null;
+  let hit = vendors.find(v => norm(v.name) === t || v.aliases.some(a => norm(a) === t));
+  if (hit) return hit.name;
+  const partial = vendors.filter(v => norm(v.name).includes(t) || t.includes(norm(v.name)) ||
+    v.aliases.some(a => norm(a).includes(t) || t.includes(norm(a))));
+  return partial.length === 1 ? partial[0].name : (partial.length > 1 ? partial[0].name : null);
+}
+
+async function resolveChefByToken(token, ctx) {
+  const t = norm(token);
+  if (t.length < 2) return null;
+  // 1) 師傅名單
+  const chefs = await getChefs();
+  const c = chefs.find(x => norm(x['姓名']) === t) || chefs.find(x => norm(x['姓名']).includes(t) || t.includes(norm(x['姓名'])));
+  if (c) return { userId: c['LINE ID'], name: c['姓名'], venue: c['館別'], registered: true };
+  // 2) 最近有發言的人（同一個群優先）
+  const cutoff = Date.now() - BUFFER_TTL;
+  const candidates = [];
+  for (const [uid, list] of buffers) {
+    const recent = list.filter(i => i.ts >= cutoff && (!ctx.chatId || i.chatId === ctx.chatId || ctx.anyChat));
+    if (!recent.length) continue;
+    const last = recent[recent.length - 1];
+    const dn = await displayNameOf(uid, last.chatId, last.chatType);
+    if (dn && norm(dn).includes(t)) candidates.push({ userId: uid, dn, chatId: last.chatId });
+  }
+  if (!candidates.length) return null;
+  const pick = candidates[0];
+  const parsed = parseDisplayName(pick.dn);
+  return { userId: pick.userId, name: parsed.name, venue: parsed.venue, registered: false, chatId: pick.chatId };
+}
+
+async function chefInfoByUserId(userId, chatId, chatType) {
+  const chefs = await getChefs();
+  const c = chefs.find(x => x['LINE ID'] === userId);
+  if (c) return { userId, name: c['姓名'], venue: c['館別'], registered: true };
+  const dn = await displayNameOf(userId, chatId, chatType);
+  const parsed = parseDisplayName(dn);
+  return { userId, name: parsed.name || '師傅', venue: parsed.venue, registered: false };
+}
+
+// ============================================================
+//  建立草稿（預覽）
+// ============================================================
+async function buildDraft({ chef, vendorToken, descTokens, quoted, byAdmin }) {
+  const vendors = await getVendors();
+  const list = buffers.get(chef.userId) || [];
+  let items;
+  if (quoted) items = list.filter(i => i.chatId === quoted.chatId && Math.abs(i.ts - quoted.ts) <= QUOTE_WINDOW_MS);
+  else items = list.filter(i => i.ts >= Date.now() - WINDOW_MS);
+  items.sort((a, b) => a.ts - b.ts);
+
+  const texts = items.filter(i => i.type === 'text' && !parseCommand(i.text)).map(i => i.text.trim()).filter(Boolean);
+  const photos = items.filter(i => i.type === 'image').slice(-MAX_PHOTOS).map(i => ({ messageId: i.messageId, ts: i.ts }));
+  const src = items.length ? items[items.length - 1] : null;
+
+  let vendor = vendorToken ? matchVendor(vendorToken, vendors) : null;
+  let vendorUnconfirmed = false;
+  if (!vendor) {
+    // 從師傅原話裡找廠商
+    for (const t of texts.join(' ').split(/[\s，,。、；;：:]+/)) { const v = matchVendor(t, vendors); if (v) { vendor = v; break; } }
+  }
+  if (!vendor) { vendor = vendorToken || '未填'; vendorUnconfirmed = true; }
+
+  const description = descTokens && descTokens.length ? descTokens.join(' ') : texts.join('；');
+
+  // 館別：師傅名單 > 顯示名稱 > 該群設定
+  let venue = chef.venue || '';
+  if (!venue && src && src.chatType === 'group') {
+    const g = await getGroups();
+    venue = g.venues[src.chatId] || '';
+  }
+
+  const id = String(Date.now()) + Math.random().toString(36).slice(2, 6);
+  const draft = {
+    id, createdAt: Date.now(), chef, venue, vendor, vendorUnconfirmed, description, photos,
+    sourceChatId: src ? src.chatId : chef.userId, sourceChatType: src ? src.chatType : 'user',
+    byAdmin: byAdmin || null,
+  };
+  drafts.set(id, draft);
+  lastDraftId = id;
+  return draft;
+}
+
+function previewFlex(d) {
+  const photoLine = d.photos.length ? d.photos.map((p, i) => `${'①②③④⑤'[i] || (i + 1)}${hhmm(p.ts)}`).join('  ') : '（無）';
   const rows = [
-    ['廠商', s.vendor ? s.vendor : `${s.vendorText || '未填'}（待採購確認）`],
-    ['照片', `${s.photos.length} 張`],
-    ['問題', s.description],
-    ['分類', s.category],
-    ['館別', venue],
+    ['師傅', `${d.venue || '館別未知'} ${d.chef.name}`],
+    ['廠商', d.vendorUnconfirmed ? `${d.vendor} ⚠ 待確認` : d.vendor],
+    ['描述', d.description || '（無文字）'],
+    ['照片', photoLine],
   ];
   return {
-    type: 'flex', altText: '請確認反映內容',
+    type: 'flex', altText: `預覽：${d.chef.name}｜${d.vendor}`,
     contents: {
       type: 'bubble',
       body: { type: 'box', layout: 'vertical', spacing: 'sm', contents: [
-        { type: 'text', text: '📋 請確認反映內容', weight: 'bold', size: 'md', color: BRAND },
+        { type: 'text', text: '📋 預覽（尚未建立）', weight: 'bold', size: 'md', color: BRAND },
         ...rows.map(([k, v]) => ({ type: 'box', layout: 'baseline', spacing: 'sm', contents: [
           { type: 'text', text: k, size: 'sm', color: '#888888', flex: 1 },
-          { type: 'text', text: String(v), size: 'sm', wrap: true, flex: 4 },
+          { type: 'text', text: String(v), size: 'sm', wrap: true, flex: 5 },
         ] })),
+        { type: 'text', text: '修改：重打 #開單 帶正確內容｜刪照片：#刪照片 2', size: 'xs', color: '#999999', wrap: true, margin: 'md' },
       ] },
       footer: { type: 'box', layout: 'horizontal', spacing: 'sm', contents: [
-        { type: 'button', style: 'primary', color: BRAND, action: pb('送出反映', 'a=submit') },
-        { type: 'button', style: 'secondary', action: pb('重填', 'a=edit') },
-        { type: 'button', style: 'secondary', action: pb('取消', 'a=cancel') },
+        { type: 'button', style: 'primary', color: BRAND, action: pb('確認建立', `a=confirm&d=${d.id}`) },
+        { type: 'button', style: 'secondary', action: pb('取消', `a=discard&d=${d.id}`) },
       ] },
     },
   };
@@ -177,10 +288,10 @@ function caseFlex(c, opts = {}) {
   if (c['照片連結']) buttons.push({ type: 'button', style: 'secondary', action: { type: 'uri', label: '查看照片', uri: c['照片連結'] } });
   const lines = [
     { type: 'text', text: `${opts.title || '🔔 新案件'} ${id}`, weight: 'bold', size: 'md', color: BRAND },
-    { type: 'text', text: `${c['館別']}｜${c['師傅']}`, size: 'sm', color: '#888888' },
+    { type: 'text', text: `${c['館別']}｜${c['師傅']}${c['開單人'] ? '｜開單：' + c['開單人'] : ''}`, size: 'sm', color: '#888888', wrap: true },
     { type: 'text', text: `廠商：${c['廠商']}${c['廠商待確認'] ? '（待確認）' : ''}`, wrap: true },
-    { type: 'text', text: `問題：${c['問題描述']}`, wrap: true },
-    { type: 'text', text: `分類：${c['問題分類'] || '—'}｜狀態：${status}${c['負責人'] ? '｜' + c['負責人'] : ''}`, size: 'sm', color: '#888888', wrap: true },
+    { type: 'text', text: `問題：${c['問題描述'] || '—'}`, wrap: true },
+    { type: 'text', text: `狀態：${status}${c['負責人'] ? '｜' + c['負責人'] : ''}`, size: 'sm', color: '#888888', wrap: true },
   ];
   return {
     type: 'flex', altText: `案件 ${id}`,
@@ -191,20 +302,67 @@ function caseFlex(c, opts = {}) {
   };
 }
 
+// 把預覽送到採購群（若指令就是在採購群打的，用 reply 回；否則 push）
+async function sendPreview(draft, ctx) {
+  const g = await getGroups();
+  const pg = g.purchasingGroupId;
+  if (pg && ctx.chatId !== pg) {
+    await safePush(pg, [previewFlex(draft)]);
+    return ctx.inVenueGroup ? [] : [text('📋 預覽已送到採購群，請到那邊確認。')];
+  }
+  return [previewFlex(draft)];
+}
+
+// ============================================================
+//  確認建立
+// ============================================================
+async function confirmDraft(draftId, admin) {
+  const d = drafts.get(draftId);
+  if (!d) return [text('這張預覽已失效（可能超過 30 分鐘或已被處理），請重新 #開單。')];
+  drafts.delete(draftId);
+  if (lastDraftId === draftId) lastDraftId = null;
+
+  // 自動登記師傅
+  if (!d.chef.registered) {
+    try { await gas('registerChef', { userId: d.chef.userId, name: d.chef.name, venue: d.venue }); cache.chefs = null; } catch (e) { console.error(e); }
+  }
+  // 下載照片
+  const photos = [];
+  for (const p of d.photos) {
+    try { photos.push({ base64: await downloadImage(p.messageId), mime: 'image/jpeg' }); }
+    catch (e) { console.error('photo download failed', p.messageId, e.message); }
+  }
+  const { case: c, caseId } = await gas('createCase', {
+    venue: d.venue, chefName: d.chef.name, chefId: d.chef.userId,
+    vendor: d.vendor, vendorUnconfirmed: d.vendorUnconfirmed,
+    description: d.description, category: '', photos,
+    source: d.sourceChatType === 'user' ? '一對一' : d.sourceChatId,
+    createdBy: admin ? admin['姓名'] : '',
+  });
+
+  // 通知師傅端（來源群或一對一）一行
+  const line1 = `✅ 已建立案件 ${caseId}（${d.vendor}／${(d.description || '').slice(0, 30)}），採購處理中。`;
+  const g = await getGroups();
+  if (d.sourceChatType === 'user') await safePush(d.chef.userId, [text(line1)]);
+  else if (g.venues[d.sourceChatId]) await safePush(d.sourceChatId, [text(line1)]);
+
+  return [caseFlex(c)];
+}
+
 // ============================================================
 //  Webhook
 // ============================================================
-app.get('/', (req, res) => res.send('vendor-complaint-bot ok'));
+app.get('/', (req, res) => res.send('vendor-complaint-bot v2 ok'));
 app.post('/webhook', line.middleware(config), (req, res) => {
   res.status(200).end();
   handleBatch(req.body.events).catch(err => console.error('batch error', err));
 });
 
-// 同一個人同一批訊息合併處理，只回一次（reply 免費、push 要算額度）
 async function handleBatch(events) {
+  for (const ev of events) remember(ev);
   const groups = new Map();
   for (const ev of events) {
-    const key = (ev.source.groupId || ev.source.userId || 'x') + ':' + (ev.source.userId || '');
+    const key = (ev.source.groupId || ev.source.roomId || ev.source.userId || 'x') + ':' + (ev.source.userId || '');
     if (!groups.has(key)) groups.set(key, []);
     groups.get(key).push(ev);
   }
@@ -213,12 +371,12 @@ async function handleBatch(events) {
     let replyToken = null;
     for (const ev of evs) {
       try {
-        const out = ev.source.type === 'group' ? await handleGroup(ev) : ev.source.type === 'user' ? await handleUser(ev) : [];
+        const out = await handleEvent(ev);
         if (out && out.length) replies.push(...out);
         if (ev.replyToken) replyToken = ev.replyToken;
       } catch (e) {
         console.error('event error', e);
-        replies.push(text('系統發生錯誤，請稍後再試或通知管理者。'));
+        replies.push(text('系統發生錯誤：' + (e.message || '').slice(0, 80)));
       }
     }
     if (replyToken && replies.length) {
@@ -228,314 +386,239 @@ async function handleBatch(events) {
   }
 }
 
-// ============================================================
-//  一對一：師傅
-// ============================================================
-async function handleUser(ev) {
-  const userId = ev.source.userId;
+async function handleEvent(ev) {
   if (ev.type !== 'message' && ev.type !== 'postback') return [];
-
-  const msgText = ev.type === 'message' && ev.message.type === 'text' ? ev.message.text.trim() : null;
-  const isImage = ev.type === 'message' && ev.message.type === 'image';
-  const pbData = ev.type === 'postback' ? parsePb(ev.postback.data) : null;
-  const s = getSession(userId);
-
-  // 通用指令
-  if (msgText === '#我的ID') return [text(`你的 LINE ID：\n${userId}`)];
-  if (msgText === '#取消' || msgText === '取消') {
-    if (!s) return [];
-    clearSession(userId);
-    return [text('已取消，這次反應不會送出。')];
-  }
-
-  // 採購在一對一也可以下指令
-  if (msgText && msgText.startsWith('#')) {
-    const admin = await getAdmin(userId);
-    if (admin) {
-      const r = await handleAdminCommand(msgText, admin, userId);
-      if (r) return r;
-    }
-  }
-
-  // 進行中的流程：註冊或反映
-  if (s) {
-    if (s.stage.startsWith('reg_')) return handleRegistration(ev, userId, s, msgText, pbData);
-    const chef = await getChef(userId);
-    if (chef) return handleComplaint(ev, userId, chef, s, msgText, isImage, pbData);
-    clearSession(userId);
-    return [];
-  }
-
-  // 沒有進行中的流程：只認觸發字，其他一律不理（讓採購正常聊天）
-  const rest = matchTrigger(msgText);
-  if (rest !== null) {
-    const chef = await getChef(userId);
-    if (!chef) return startRegistration(userId);
-    const ns = setSession(userId, newComplaint());
-    if (rest) return handleComplaint(ev, userId, chef, ns, rest, false, null);
-    return [text('好的，請把「廠商名＋問題描述」和「1-3 張照片」傳給我。\n例如：ＸＸ（廠商）的ＸＸ（商品）不新鮮，很多都爛了\n\n📌 中途想放棄，請輸入【取消】')];
-  }
-  if (msgText === '#我的案件') {
-    const { cases } = await gas('getOpenCases');
-    const mine = cases.filter(c => c['師傅LINE ID'] === userId);
-    if (!mine.length) return [text('你目前沒有未結案的反映。')];
-    return [text('你目前未結案的反映：\n' + mine.map(c => `${c['案件編號']}｜${c['廠商']}｜${c['狀態']}${c['負責人'] ? '（' + c['負責人'] + '）' : ''}`).join('\n'))];
-  }
-  return [];
-}
-
-function newComplaint() {
-  return { stage: 'collect', vendor: null, vendorText: null, vendorUnconfirmed: false, description: null, category: null, photos: [] };
-}
-
-// ---------- 註冊 ----------
-function startRegistration(userId) {
-  setSession(userId, { stage: 'reg_venue' });
-  return [quick('你好！第一次使用請先設定，請問你在哪個館？', VENUES.map(v => pb(v, `a=venue&v=${encodeURIComponent(v)}`)))];
-}
-async function handleRegistration(ev, userId, s, msgText, pbData) {
-  if (s.stage === 'reg_venue') {
-    const v = pbData?.a === 'venue' ? pbData.v : (VENUES.includes(msgText) ? msgText : null);
-    if (!v) return [quick('請點選你所在的館別：', VENUES.map(x => pb(x, `a=venue&v=${encodeURIComponent(x)}`)))];
-    s.venue = v; s.stage = 'reg_name'; setSession(userId, s);
-    let display = '';
-    try { display = (await client.getProfile(userId)).displayName; } catch (e) {}
-    const items = display ? [pb(`用「${display}」`, `a=name&v=${encodeURIComponent(display)}`)] : [];
-    return [quick('請問怎麼稱呼？（直接輸入名字）', items)];
-  }
-  if (s.stage === 'reg_name') {
-    const name = pbData?.a === 'name' ? pbData.v : msgText;
-    if (!name) return [text('請輸入你的名字。')];
-    await gas('registerChef', { userId, name, venue: s.venue });
-    cache.chef.delete(userId);
-    setSession(userId, newComplaint());
-    return [text(`設定完成！${s.venue} ${name} 師傅你好。\n\n現在請把「廠商名＋問題描述」和「1-3 張照片」傳給我，例如：\nＸＸ（廠商）的ＸＸ（商品）不新鮮，很多都爛了（＋照片）\n\n📌 小提醒\n1. 如需反應廠商/食品問題，請先輸入【NG商品】\n2. 中途想放棄，請輸入【取消】`)];
-  }
-  return [];
-}
-
-// ---------- 反映流程 ----------
-async function handleComplaint(ev, userId, chef, s, msgText, isImage, pbData) {
-  const venue = chef['館別'];
-
-  // 圖片：任何階段都收
-  if (isImage) {
-    if (s.photos.length >= MAX_PHOTOS) return [text(`最多 ${MAX_PHOTOS} 張照片，這張就不收了。`)];
-    s.photos.push({ base64: await downloadImage(ev.message.id), mime: 'image/jpeg' });
-    setSession(userId, s);
-    return nextStep(userId, s, venue, `收到照片（${s.photos.length}/${MAX_PHOTOS}）。`);
-  }
-
-  // 確認卡的按鈕
-  if (pbData) {
-    if (pbData.a === 'cancel') { clearSession(userId); return [text('已取消，這次反應不會送出。')]; }
-    if (pbData.a === 'edit') { setSession(userId, newComplaint()); return [text('好，請重新傳一次「廠商名＋問題」和照片。')]; }
-    if (pbData.a === 'vendor') {
-      s.vendor = pbData.v; s.vendorUnconfirmed = false; s.stage = 'collect'; setSession(userId, s);
-      return nextStep(userId, s, venue, `廠商：${s.vendor}。`);
-    }
-    if (pbData.a === 'vendor_other') {
-      s.vendor = null; s.vendorUnconfirmed = true; s.stage = 'collect'; setSession(userId, s);
-      return nextStep(userId, s, venue, `好，先記「${s.vendorText}」，採購會再確認。`);
-    }
-    if (pbData.a === 'submit') return submitCase(userId, chef, s);
-    return [];
-  }
-
-  if (!msgText) return [];
-
-  // 問廠商階段：這句話就是廠商名
-  if (s.stage === 'ask_vendor' || s.stage === 'pick_vendor') {
-    const vendors = await getVendors();
-    const hits = matchVendors(msgText, vendors);
-    s.vendorText = msgText;
-    if (hits.length === 1) { s.vendor = hits[0]; s.vendorUnconfirmed = false; }
-    else if (hits.length > 1) return askPick(userId, s, hits);
-    else { s.vendor = null; s.vendorUnconfirmed = true; }
-    s.stage = 'collect'; setSession(userId, s);
-    return nextStep(userId, s, venue, s.vendor ? `廠商：${s.vendor}。` : `先記「${msgText}」，採購會再確認廠商。`);
-  }
-
-  // 一般文字：交給 Gemini 拆解
-  const vendors = await getVendors();
-  const a = await analyze(msgText, vendors);
-  s.description = s.description ? `${s.description}；${a.description}` : a.description;
-  s.category = a.category;
-  if (!s.vendor) {
-    if (a.vendor_match) { s.vendor = a.vendor_match; s.vendorUnconfirmed = false; s.vendorText = a.vendor_text; }
-    else if (a.vendor_text) {
-      s.vendorText = a.vendor_text;
-      const hits = matchVendors(a.vendor_text, vendors);
-      if (hits.length === 1) s.vendor = hits[0];
-      else if (hits.length > 1) { setSession(userId, s); return askPick(userId, s, hits); }
-      else s.vendorUnconfirmed = true;
-    }
-  }
-  setSession(userId, s);
-  return nextStep(userId, s, venue, '收到。');
-}
-
-function askPick(userId, s, hits) {
-  s.stage = 'pick_vendor'; setSession(userId, s);
-  const items = hits.slice(0, 3).map(h => pb(h, `a=vendor&v=${encodeURIComponent(h)}`));
-  items.push(pb('都不是', 'a=vendor_other'));
-  return [quick('請問是哪一家廠商？', items)];
-}
-
-// 決定下一步要問什麼
-function nextStep(userId, s, venue, prefix) {
-  if (!s.description && !s.vendor && !s.vendorText) {
-    s.stage = 'collect'; setSession(userId, s);
-    return [text(`${prefix}\n請用文字說明一下：哪一家廠商、什麼問題？\n例如：ＸＸ（廠商）的ＸＸ（商品）不新鮮，很多都爛了`)];
-  }
-  if (!s.vendor && !s.vendorText) {
-    s.stage = 'ask_vendor'; setSession(userId, s);
-    return [text(`${prefix}\n請問是哪一家廠商？`)];
-  }
-  if (!s.description) {
-    s.stage = 'collect'; setSession(userId, s);
-    return [text(`${prefix}\n請簡單描述一下問題（例如：不新鮮很多都爛了、少送兩箱）。`)];
-  }
-  if (s.photos.length === 0) {
-    s.stage = 'collect'; setSession(userId, s);
-    return [text(`${prefix}\n請傳 1-3 張照片，方便採購跟廠商反映。`)];
-  }
-  s.stage = 'confirm'; setSession(userId, s);
-  return [confirmFlex(s, venue)];
-}
-
-async function submitCase(userId, chef, s) {
-  const { caseId, photoUrl } = await gas('createCase', {
-    venue: chef['館別'], chefName: chef['姓名'], chefId: userId,
-    vendor: s.vendor || s.vendorText || '未填', vendorUnconfirmed: !s.vendor,
-    description: s.description, category: s.category, photos: s.photos,
-  });
-  clearSession(userId);
-
-  // 通知採購
-  const { case: c } = await gas('getCase', { caseId });
-  const { value: groupId } = await gas('getConfig', { key: '採購群ID' });
-  if (groupId) await safePush(groupId, [caseFlex(c)]);
-  else {
-    const { admins } = await gas('getAdmins');
-    for (const a of admins) await safePush(a['LINE ID'], [caseFlex(c)]);
-  }
-  return [text(`✅ 已建立案件 ${caseId}，採購已收到通知，處理進度會再回報你。\n\n採購如果有問題會直接在這裡問你，正常回覆就好。`)];
-}
-
-// ============================================================
-//  群組：採購
-// ============================================================
-async function handleGroup(ev) {
-  const groupId = ev.source.groupId;
   const userId = ev.source.userId;
-
-  if (ev.type === 'join') {
-    return [text('大家好，我是廠商反映機器人。\n請一位採購輸入「#設定採購群」把這個群設為案件通知群，\n每位採購請輸入「#我是採購 你的名字」完成登記。')];
-  }
-  if (ev.type !== 'message' && ev.type !== 'postback') return [];
-  const msgText = ev.type === 'message' && ev.message.type === 'text' ? ev.message.text.trim() : null;
-  const pbData = ev.type === 'postback' ? parsePb(ev.postback.data) : null;
   if (!userId) return [];
+  const chatType = ev.source.type;
+  const chatId = chatType === 'group' ? ev.source.groupId : chatType === 'room' ? ev.source.roomId : userId;
+  const msgText = ev.type === 'message' && ev.message.type === 'text' ? ev.message.text : null;
+  const pbData = ev.type === 'postback' ? parsePb(ev.postback.data) : null;
 
-  // 登記與設定
-  const normalized = msgText ? msgText.replace(/^[#＃]\s*/, '#') : null;
-  if (normalized === '#設定採購群' || normalized === '設定採購群') {
-    await gas('setConfig', { key: '採購群ID', value: groupId });
-    return [text('✅ 已將這個群設為採購案件通知群。')];
-  }
-  const regMatch = normalized && normalized.match(/^#?我是採購\s*(.*)$/);
-  if (regMatch) {
-    const name = regMatch[1].trim();
-    if (!name) return [text('請在後面加上名字，例如：#我是採購 小美')];
-    await gas('registerAdmin', { userId, name });
-    cache.admin.delete(userId);
-    return [text(`✅ ${name} 已登記為採購。`)];
-  }
+  const g = await getGroups();
+  const isPurchasingGroup = chatType !== 'user' && chatId === g.purchasingGroupId;
+  const venueOfGroup = chatType !== 'user' ? (g.venues[chatId] || '') : '';
+  const inVenueGroup = !!venueOfGroup;
+  const ctx = { chatId, chatType, isPurchasingGroup, inVenueGroup, anyChat: isPurchasingGroup || chatType === 'user' };
 
-  const admin = await getAdmin(userId);
-  const s = getSession(userId);
-
-  // 結案中：這句話就是處理結果
-  if (admin && s && s.stage === 'closing' && msgText) {
-    if (msgText === '取消' || msgText === '#取消') { clearSession(userId); return [text('已取消結案。')]; }
-    if (!msgText.startsWith('#')) { clearSession(userId); return closeCase(s.caseId, admin, msgText); }
-  }
-
+  // ---- 按鈕（只在採購群 / 一對一 理會）----
   if (pbData) {
-    if (!admin) return [text('請先輸入「#我是採購 你的名字」完成登記，再按按鈕。')];
+    if (!isPurchasingGroup && chatType !== 'user') return [];
+    const admin = await getAdmin(userId);
+    if (!admin) return [text('請先登記：#我是採購 你的名字')];
+    if (pbData.a === 'confirm') return confirmDraft(pbData.d, admin);
+    if (pbData.a === 'discard') { drafts.delete(pbData.d); return [text('已取消這張預覽。')]; }
     if (pbData.a === 'take') {
       const r = await gas('takeCase', { caseId: pbData.id, adminName: admin['姓名'] });
       if (r.already) return [text(`案件 ${pbData.id} 已由 ${r.handler} 接手。`)];
-      const c = r.case;
-      await safePush(c['師傅LINE ID'], [text(`採購 ${admin['姓名']} 已接手你的案件 ${pbData.id}，如需補充細節會直接在這裡問你。`)]);
-      return [text(`${admin['姓名']} 已接手 ${pbData.id}`), caseFlex(c, { title: '🛠 處理中' })];
+      return [text(`${admin['姓名']} 已接手 ${pbData.id}`), caseFlex(r.case, { title: '🛠 處理中' })];
     }
     if (pbData.a === 'close') {
-      setSession(userId, { stage: 'closing', caseId: pbData.id });
+      drafts.set('closing:' + userId, { closingCaseId: pbData.id, createdAt: Date.now() });
       return [text(`${admin['姓名']}，請直接輸入案件 ${pbData.id} 的處理結果（例如：廠商同意明日補貨 2 箱）。\n輸入【取消】可放棄。`)];
     }
     return [];
   }
 
-  if (msgText && msgText.startsWith('#')) {
-    if (msgText === '#取消') { clearSession(userId); return [text('已取消。')]; }
-    if (!admin) return [text('請先輸入「#我是採購 你的名字」完成登記。')];
-    const r = await handleAdminCommand(msgText, admin, userId);
-    if (r) return r;
+  if (!msgText) {
+    // 圖片等：只暫存，不回；若師傅剛打過 NG，照片進來就重新計時
+    if (ngTimers.has(userId)) scheduleNgDraft(userId, chatId, chatType);
+    return [];
   }
-  return []; // 其他閒聊一律不理
-}
 
-// 採購文字指令（群組或一對一都可用）
-async function handleAdminCommand(msgText, admin, userId) {
-  const [cmd, ...rest] = msgText.split(/\s+/);
-  if (cmd === '#未結案') {
+  const cmd = parseCommand(msgText);
+
+  // ---- 師傅打 NG 開頭（一對一或師傅群）→ 60 秒後自動出預覽到採購群 ----
+  if (!cmd && isNgMessage(msgText) && (chatType === 'user' || inVenueGroup)) {
+    scheduleNgDraft(userId, chatId, chatType);
+    return [];
+  }
+
+  if (!cmd) {
+    // 結案中：這句話就是處理結果（採購在採購群或一對一）
+    const closing = drafts.get('closing:' + userId);
+    if (closing && (isPurchasingGroup || chatType === 'user')) {
+      const admin = await getAdmin(userId);
+      if (admin) {
+        drafts.delete('closing:' + userId);
+        return closeCase(closing.closingCaseId, admin, msgText.trim());
+      }
+    }
+    return []; // 其他一律不理
+  }
+
+  // ---- 登記 / 設定（不需要先是採購）----
+  if (cmd.cmd === '我的ID') return [text(`你的 LINE ID：\n${userId}`)];
+  if (cmd.cmd === '設定採購群') {
+    if (chatType === 'user') return [text('請在採購群裡輸入這個指令。')];
+    await gas('setConfig', { key: '採購群ID', value: chatId });
+    cache.groups = null;
+    return [text('✅ 已將這個群設為採購案件通知群。')];
+  }
+  if (cmd.cmd === '我是採購') {
+    const name = cmd.tokens.join(' ').trim();
+    if (!name) return [text('請在後面加上名字，例如：#我是採購 小美')];
+    if (!isPurchasingGroup && chatType !== 'user') return [];
+    await gas('registerAdmin', { userId, name });
+    cache.admins.delete(userId);
+    return [text(`✅ ${name} 已登記為採購。`)];
+  }
+
+  // ---- 以下都要是採購 ----
+  const admin = await getAdmin(userId);
+  if (!admin) {
+    if (cmd.cmd === '取消') return [];
+    if (isPurchasingGroup || chatType === 'user') return [text('請先在採購群登記：#我是採購 你的名字')];
+    if (inVenueGroup && cmd.cmd === '開單') return [text('請先在採購群登記：#我是採購 你的名字')];
+    return [];
+  }
+  // 未設定的群（例如廠商群）：完全不回
+  if (chatType !== 'user' && !isPurchasingGroup && !inVenueGroup && cmd.cmd !== '設定館別') return [];
+
+  if (cmd.cmd === '設定館別') {
+    if (chatType === 'user') return [text('請在師傅群裡輸入這個指令。')];
+    const v = cmd.tokens.find(t => VENUES.includes(t)) || cmd.tokens.find(t => VENUES.includes(t + '館'));
+    if (!v) return [text('格式：#設定館別 大直館／新莊館／士林館')];
+    const venue = VENUES.includes(v) ? v : v + '館';
+    await gas('setGroupVenue', { groupId: chatId, venue });
+    cache.groups = null;
+    return [text(`✅ 這個群已設定為「${venue}」師傅群。採購在這裡打 #開單 就能建案。`)];
+  }
+
+  if (cmd.cmd === '取消') {
+    if (drafts.has('closing:' + userId)) { drafts.delete('closing:' + userId); return [text('已取消結案。')]; }
+    if (lastDraftId && drafts.has(lastDraftId)) { drafts.delete(lastDraftId); lastDraftId = null; return [text('已取消預覽。')]; }
+    return [];
+  }
+
+  if (cmd.cmd === '開單') return openCase(ev, cmd, admin, ctx);
+
+  if (cmd.cmd === '刪照片') {
+    const d = lastDraftId ? drafts.get(lastDraftId) : null;
+    if (!d) return [text('目前沒有待確認的預覽。')];
+    const nums = cmd.tokens.join(' ').match(/\d+/g);
+    if (!nums) return [text('格式：#刪照片 2（照片編號）')];
+    const idx = new Set(nums.map(n => parseInt(n, 10) - 1));
+    d.photos = d.photos.filter((p, i) => !idx.has(i));
+    return sendPreview(d, ctx);
+  }
+
+  if (cmd.cmd === '確認') {
+    if (!lastDraftId || !drafts.has(lastDraftId)) return [text('目前沒有待確認的預覽。')];
+    return confirmDraft(lastDraftId, admin);
+  }
+
+  if (cmd.cmd === '未結案') {
     const { cases } = await gas('getOpenCases');
     if (!cases.length) return [text('目前沒有未結案的案件 🎉')];
     return [text('未結案：\n' + cases.map(c => `${c['案件編號']}｜${c['館別']}｜${c['廠商']}｜${c['狀態']}${c['負責人'] ? '（' + c['負責人'] + '）' : ''}`).join('\n'))];
   }
-  if (cmd === '#結案') {
-    const [id, ...res] = rest;
-    if (!id || !res.length) return [text('格式：#結案 案件編號 處理結果\n例如：#結案 20260904-01 廠商同意明日補貨2箱')];
-    return closeCase(id, admin, res.join(' '));
-  }
-  if (cmd === '#廠商') {
-    const [id, ...v] = rest;
-    if (!id || !v.length) return [text('格式：#廠商 案件編號 正確廠商名')];
-    await gas('updateVendor', { caseId: id, vendor: v.join(' '), adminName: admin['姓名'] });
-    return [text(`✅ 案件 ${id} 廠商已改為「${v.join(' ')}」`)];
-  }
-  if (cmd === '#案件') {
-    const id = rest[0];
+  if (cmd.cmd === '案件') {
+    const id = cmd.tokens[0];
     if (!id) return [text('格式：#案件 案件編號')];
     const { case: c } = await gas('getCase', { caseId: id });
     if (!c) return [text('找不到這個案件。')];
     return [caseFlex(c, { title: '📄 案件' })];
   }
-  if (cmd === '#開單') {
-    const q = rest.join(' ').trim();
-    if (!q) return [text('格式：#開單 師傅名字\n例如：#開單 慶哥')];
-    const { chefs } = await gas('findChefs', { name: q });
-    if (!chefs.length) return [text(`找不到叫「${q}」的師傅。師傅要先跟 LINE@ 打過「NG商品」完成設定，名單裡才有他。`)];
-    if (chefs.length > 1) return [text('找到多位，請打更完整的名字：\n' + chefs.map(c => `${c['館別']} ${c['姓名']}`).join('\n'))];
-    const chef = chefs[0];
-    setSession(chef['LINE ID'], newComplaint());
-    await safePush(chef['LINE ID'], [text(`採購 ${admin['姓名']} 幫你開了 NG商品 反應流程。\n請把「廠商名＋問題描述」和「1-3 張照片」傳給我，例如：\nＸＸ（廠商）的ＸＸ（商品）不新鮮，很多都爛了\n\n📌 中途想放棄，請輸入【取消】`)]);
-    return [text(`✅ 已請 ${chef['館別']} ${chef['姓名']} 師傅傳送反應內容。`)];
+  if (cmd.cmd === '結案') {
+    const [id, ...res] = cmd.tokens;
+    if (!id || !res.length) return [text('格式：#結案 案件編號 處理結果\n例如：#結案 20260908-01 廠商同意明日補貨2箱')];
+    return closeCase(id, admin, res.join(' '));
   }
-  if (cmd === '#說明') {
-    return [text('採購指令：\n#未結案 — 列出未結案\n#案件 編號 — 查看案件\n#結案 編號 處理結果 — 結案\n#廠商 編號 正確廠商名 — 修正廠商\n#開單 師傅名字 — 幫師傅開啟反應流程\n#設定採購群 — 把目前群組設為通知群\n#我是採購 名字 — 登記為採購')];
+  if (cmd.cmd === '廠商') {
+    const [id, ...v] = cmd.tokens;
+    if (!id || !v.length) return [text('格式：#廠商 案件編號 正確廠商名')];
+    await gas('updateVendor', { caseId: id, vendor: v.join(' '), adminName: admin['姓名'] });
+    return [text(`✅ 案件 ${id} 廠商已改為「${v.join(' ')}」`)];
   }
-  return null;
+  if (cmd.cmd === '作廢') {
+    const [id, ...reason] = cmd.tokens;
+    if (!id) return [text('格式：#作廢 案件編號 原因（選填）')];
+    await gas('voidCase', { caseId: id, adminName: admin['姓名'], reason: reason.join(' ') });
+    return [text(`🗑 案件 ${id} 已作廢。`)];
+  }
+  if (cmd.cmd === '說明') {
+    return [text('採購指令：\n#開單 師傅名 廠商名 [補充描述] — 建案（可引用師傅訊息，省略師傅名）\n#刪照片 2 — 預覽時刪掉第 2 張\n#確認 — 確認最新預覽（同按鈕）\n#未結案 — 列出未結案\n#案件 編號 — 查看案件\n#結案 編號 處理結果\n#廠商 編號 正確廠商名 — 修正廠商\n#作廢 編號 — 作廢案件\n#設定館別 ○○館 — 在師傅群設定館別\n#設定採購群 — 在採購群設定\n#我是採購 名字 — 登記為採購')];
+  }
+  return [];
+}
+
+// ============================================================
+//  #開單
+// ============================================================
+async function openCase(ev, cmd, admin, ctx) {
+  const vendors = await getVendors();
+  const quotedId = ev.message && ev.message.quotedMessageId;
+  let chef = null;
+  let quoted = null;
+  let tokens = [...cmd.tokens];
+
+  if (quotedId) {
+    const found = findBufferedMessage(quotedId);
+    if (found) {
+      quoted = found.item;
+      chef = await chefInfoByUserId(found.userId, found.item.chatId, found.item.chatType);
+    }
+  }
+
+  // 找師傅：逐個 token 試（不限順序）
+  let chefToken = null;
+  if (!chef) {
+    for (const t of tokens) {
+      if (matchVendor(t, vendors)) continue; // 是廠商就跳過
+      const c = await resolveChefByToken(t, ctx);
+      if (c) { chef = c; chefToken = t; break; }
+    }
+  }
+  if (!chef) {
+    return [text('找不到師傅。請確認名字跟他在群裡的顯示名稱一致，且他最近 30 分鐘內有傳訊息；或長按師傅的訊息 →「回覆」再打 #開單 廠商名。')];
+  }
+  if (chefToken) tokens = tokens.filter(t => t !== chefToken);
+
+  // 找廠商：逐個 token 試
+  let vendorToken = null;
+  for (const t of tokens) { if (matchVendor(t, vendors)) { vendorToken = t; break; } }
+  if (!vendorToken && tokens.length) vendorToken = tokens[0]; // 都對不到：第一個當廠商（待確認）
+  if (vendorToken) tokens = tokens.filter(t => t !== vendorToken);
+
+  // 若有舊預覽，先丟掉
+  if (lastDraftId && drafts.has(lastDraftId)) drafts.delete(lastDraftId);
+
+  const draft = await buildDraft({ chef, vendorToken, descTokens: tokens, quoted, byAdmin: admin });
+  if (!draft.description && !draft.photos.length) {
+    drafts.delete(draft.id); lastDraftId = null;
+    return [text(`${chef.name} 最近 10 分鐘沒有可用的訊息或照片，請他再傳一次，或引用他的訊息開單。`)];
+  }
+  return sendPreview(draft, ctx);
+}
+
+// 師傅打 NG 開頭：60 秒後把他最近的訊息做成預覽，送採購群
+function scheduleNgDraft(userId, chatId, chatType) {
+  if (ngTimers.has(userId)) clearTimeout(ngTimers.get(userId));
+  ngTimers.set(userId, setTimeout(async () => {
+    ngTimers.delete(userId);
+    try {
+      const g = await getGroups();
+      if (!g.purchasingGroupId) return;
+      const chef = await chefInfoByUserId(userId, chatId, chatType);
+      const draft = await buildDraft({ chef, vendorToken: null, descTokens: [], quoted: null, byAdmin: null });
+      // 描述去掉開頭的 NG 字樣
+      draft.description = draft.description.replace(/^[\s「」【】\[\]（）()#＃]*[nNｎＮ][gGｇＧ]\s*商品?[\s，,：:、。]*/, '').trim();
+      await safePush(g.purchasingGroupId, [text(`🔔 ${draft.venue || ''} ${chef.name} 師傅傳來 NG 反映，請確認：`), previewFlex(draft)]);
+    } catch (e) { console.error('ng draft error', e); }
+  }, NG_DEBOUNCE_MS));
 }
 
 async function closeCase(caseId, admin, result) {
   const { case: c } = await gas('closeCase', { caseId, adminName: admin['姓名'], result });
-  await safePush(c['師傅LINE ID'], [text(`✅ 你的案件 ${caseId} 已結案\n廠商：${c['廠商']}\n處理結果：${result}\n\n謝謝你的反映！`)]);
+  const msg = text(`✅ 案件 ${caseId} 已結案\n廠商：${c['廠商']}\n處理結果：${result}`);
+  const g = await getGroups();
+  const src = c['來源'];
+  if (src === '一對一' || !src) { if (c['師傅LINE ID']) await safePush(c['師傅LINE ID'], [msg]); }
+  else if (g.venues[src]) await safePush(src, [msg]);
   return [text(`✅ 案件 ${caseId} 已結案｜${admin['姓名']}\n處理結果：${result}`)];
 }
 
 // ============================================================
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log('bot listening on', PORT));
+app.listen(PORT, () => console.log('bot v2 listening on', PORT));
