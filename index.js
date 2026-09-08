@@ -144,7 +144,7 @@ function parseDisplayName(dn) {
 }
 
 // 指令解析：訊息任何位置出現 #指令 都算，其餘文字切成 tokens
-const COMMANDS = ['開單', '刪照片', '取消', '作廢', '未結案', '案件', '結案', '廠商', '說明', '設定採購群', '設定館別', '我是採購', '我的ID', '確認'];
+const COMMANDS = ['開單', '刪照片', '取消', '作廢', '未結案', '案件', '結案', '廠商', '說明', '設定採購群', '設定館別', '我是採購', '我的ID', '我的', '確認'];
 function parseCommand(t) {
   if (!t) return null;
   const s = t.replace(/\u3000/g, ' ');
@@ -302,6 +302,38 @@ function caseFlex(c, opts = {}) {
   };
 }
 
+
+// 多張案件卡（最多 10 張）
+function casesCarousel(cases, title) {
+  const bubbles = cases.slice(0, 10).map(c => caseFlex(c, { title: title || (c['狀態'] === '處理中' ? '🛠 處理中' : '🔔 待處理') }).contents);
+  return { type: 'flex', altText: `${cases.length} 件案件`, contents: { type: 'carousel', contents: bubbles } };
+}
+// 用編號或名字（師傅／廠商）找未結案；回 {case} / {choices} / null
+async function resolveOpenCase(token, adminName) {
+  const { cases } = await gas('getOpenCases');
+  if (!token) return { choices: cases };
+  if (/^\d{8}-\d{2}$/.test(token)) {
+    const { case: c } = await gas('getCase', { caseId: token });
+    return c ? { case: c } : null;
+  }
+  const t = norm(token);
+  let hits = cases.filter(c => norm(c['師傅']).includes(t) || norm(c['廠商']).includes(t) || t.includes(norm(c['廠商'])) || norm(c['館別']).includes(t));
+  if (hits.length > 1 && adminName) {
+    const mine = hits.filter(c => c['負責人'] === adminName);
+    if (mine.length === 1) hits = mine;
+  }
+  if (hits.length === 1) return { case: hits[0] };
+  if (hits.length > 1) return { choices: hits };
+  return null;
+}
+function caseQuickReply(prompt, cases, action) {
+  const items = cases.slice(0, 12).map(c => pb(`${c['廠商']}/${c['師傅']}`.slice(0, 20), `a=${action}&id=${c['案件編號']}`));
+  return quickMsg(prompt, items);
+}
+function quickMsg(t, items) {
+  return { type: 'text', text: t, quickReply: { items: items.map(i => ({ type: 'action', action: i })) } };
+}
+
 // 把預覽送到採購群（若指令就是在採購群打的，用 reply 回；否則 push）
 async function sendPreview(draft, ctx) {
   const g = await getGroups();
@@ -413,6 +445,10 @@ async function handleEvent(ev) {
       if (r.already) return [text(`案件 ${pbData.id} 已由 ${r.handler} 接手。`)];
       return [text(`${admin['姓名']} 已接手 ${pbData.id}`), caseFlex(r.case, { title: '🛠 處理中' })];
     }
+    if (pbData.a === 'void') {
+      await gas('voidCase', { caseId: pbData.id, adminName: admin['姓名'], reason: '' });
+      return [text(`🗑 案件 ${pbData.id} 已作廢。`)];
+    }
     if (pbData.a === 'close') {
       drafts.set('closing:' + userId, { closingCaseId: pbData.id, createdAt: Date.now() });
       return [text(`${admin['姓名']}，請直接輸入案件 ${pbData.id} 的處理結果（例如：廠商同意明日補貨 2 箱）。\n輸入【取消】可放棄。`)];
@@ -508,37 +544,56 @@ async function handleEvent(ev) {
     return confirmDraft(lastDraftId, admin);
   }
 
-  if (cmd.cmd === '未結案') {
-    const { cases } = await gas('getOpenCases');
-    if (!cases.length) return [text('目前沒有未結案的案件 🎉')];
-    return [text('未結案：\n' + cases.map(c => `${c['案件編號']}｜${c['館別']}｜${c['廠商']}｜${c['狀態']}${c['負責人'] ? '（' + c['負責人'] + '）' : ''}`).join('\n'))];
+  if (cmd.cmd === '未結案' || cmd.cmd === '我的') {
+    let { cases } = await gas('getOpenCases');
+    if (cmd.cmd === '我的') cases = cases.filter(c => c['負責人'] === admin['姓名']);
+    if (!cases.length) return [text(cmd.cmd === '我的' ? '你目前沒有處理中的案件。' : '目前沒有未結案的案件 🎉')];
+    const out = [casesCarousel(cases)];
+    if (cases.length > 10) out.push(text(`共 ${cases.length} 件，只顯示最近 10 件。`));
+    return out;
   }
   if (cmd.cmd === '案件') {
-    const id = cmd.tokens[0];
-    if (!id) return [text('格式：#案件 案件編號')];
-    const { case: c } = await gas('getCase', { caseId: id });
-    if (!c) return [text('找不到這個案件。')];
-    return [caseFlex(c, { title: '📄 案件' })];
+    const r = await resolveOpenCase(cmd.tokens[0], admin['姓名']);
+    if (!r) return [text('找不到這個案件。可以打編號、師傅名或廠商名。')];
+    if (r.choices) return [casesCarousel(r.choices, '📄 案件')];
+    return [caseFlex(r.case, { title: '📄 案件' })];
   }
   if (cmd.cmd === '結案') {
-    const [id, ...res] = cmd.tokens;
-    if (!id || !res.length) return [text('格式：#結案 案件編號 處理結果\n例如：#結案 20260908-01 廠商同意明日補貨2箱')];
+    // 用法：#結案（挑選）／#結案 編號或名字 處理結果
+    const [key, ...res] = cmd.tokens;
+    const r = await resolveOpenCase(key, admin['姓名']);
+    if (!r) return [text(`找不到「${key}」的案件。可以打編號、師傅名或廠商名，或直接打 #結案 從清單挑。`)];
+    if (r.choices) {
+      if (!r.choices.length) return [text('目前沒有未結案的案件。')];
+      return [caseQuickReply('要結哪一件？點一下：', r.choices, 'close')];
+    }
+    const id = r.case['案件編號'];
+    if (!res.length) {
+      drafts.set('closing:' + userId, { closingCaseId: id, createdAt: Date.now() });
+      return [text(`${admin['姓名']}，請輸入案件 ${id}（${r.case['廠商']}／${r.case['師傅']}）的處理結果。\n輸入【取消】可放棄。`)];
+    }
     return closeCase(id, admin, res.join(' '));
   }
   if (cmd.cmd === '廠商') {
-    const [id, ...v] = cmd.tokens;
-    if (!id || !v.length) return [text('格式：#廠商 案件編號 正確廠商名')];
+    const [key, ...v] = cmd.tokens;
+    if (!key || !v.length) return [text('格式：#廠商 編號或師傅名 正確廠商名')];
+    const r = await resolveOpenCase(key, admin['姓名']);
+    if (!r || r.choices) return [text('找不到唯一的案件，請改用編號。')];
+    const id = r.case['案件編號'];
     await gas('updateVendor', { caseId: id, vendor: v.join(' '), adminName: admin['姓名'] });
     return [text(`✅ 案件 ${id} 廠商已改為「${v.join(' ')}」`)];
   }
   if (cmd.cmd === '作廢') {
-    const [id, ...reason] = cmd.tokens;
-    if (!id) return [text('格式：#作廢 案件編號 原因（選填）')];
+    const [key, ...reason] = cmd.tokens;
+    const r = await resolveOpenCase(key, admin['姓名']);
+    if (!r) return [text('找不到這個案件。可以打編號、師傅名或廠商名。')];
+    if (r.choices) return [caseQuickReply('要作廢哪一件？點一下：', r.choices, 'void')];
+    const id = r.case['案件編號'];
     await gas('voidCase', { caseId: id, adminName: admin['姓名'], reason: reason.join(' ') });
     return [text(`🗑 案件 ${id} 已作廢。`)];
   }
   if (cmd.cmd === '說明') {
-    return [text('採購指令：\n#開單 師傅名 廠商名 [補充描述] — 建案（可引用師傅訊息，省略師傅名）\n#刪照片 2 — 預覽時刪掉第 2 張\n#確認 — 確認最新預覽（同按鈕）\n#未結案 — 列出未結案\n#案件 編號 — 查看案件\n#結案 編號 處理結果\n#廠商 編號 正確廠商名 — 修正廠商\n#作廢 編號 — 作廢案件\n#設定館別 ○○館 — 在師傅群設定館別\n#設定採購群 — 在採購群設定\n#我是採購 名字 — 登記為採購')];
+    return [text('採購指令：\n#開單 師傅名 廠商名 [補充描述] — 建案（可引用師傅訊息，省略師傅名）\n#刪照片 2 — 預覽時刪掉第 2 張\n#確認 — 確認最新預覽（同按鈕）\n#未結案 — 所有未結案卡片（有按鈕）\n#我的 — 我負責的案件\n#結案 — 從清單挑一件結案\n#結案 師傅名或廠商名 處理結果 — 直接結案\n#廠商 師傅名 正確廠商名 — 修正廠商\n#作廢 — 從清單挑一件作廢\n#設定館別 ○○館 — 在師傅群設定館別\n#設定採購群 — 在採購群設定\n#我是採購 名字 — 登記為採購')];
   }
   return [];
 }
