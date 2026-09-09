@@ -16,9 +16,9 @@ const GAS_KEY = process.env.GAS_KEY;
 const BRAND = '#968571';
 const VENUES = ['大直館', '新莊館', '士林館'];
 const MAX_PHOTOS = 5;
-const WINDOW_MS = 10 * 60 * 1000;        // #開單 抓師傅最近 10 分鐘
-const QUOTE_WINDOW_MS = 3 * 60 * 1000;   // 引用時抓前後 3 分鐘
-const BUFFER_TTL = 30 * 60 * 1000;       // 訊息暫存 30 分鐘後丟掉
+const BURST_GAP_MS = 15 * 60 * 1000;     // 師傅訊息間隔超過 15 分鐘就視為另一件事
+const LOOKBACK_MS = 3 * 24 * 3600 * 1000; // 訊息保存 3 天（存在試算表「訊息暫存」）
+const BUFFER_TTL = 30 * 60 * 1000;       // 記憶體暫存 30 分鐘（試算表才是正本）
 const DRAFT_TTL = 30 * 60 * 1000;        // 預覽 30 分鐘未確認作廢
 const NG_DEBOUNCE_MS = 60 * 1000;        // 師傅打 NG 後等 60 秒再出預覽
 const CACHE_TTL = 10 * 60 * 1000;
@@ -43,9 +43,50 @@ function remember(ev) {
   if (m.type !== 'text' && m.type !== 'image') return;
   const chatType = ev.source.type;
   const chatId = chatType === 'group' ? ev.source.groupId : chatType === 'room' ? ev.source.roomId : userId;
+  const item = { ts: ev.timestamp || Date.now(), type: m.type, text: m.type === 'text' ? m.text : '', messageId: m.id, chatId, chatType, userId };
   const list = buffers.get(userId) || [];
-  list.push({ ts: ev.timestamp || Date.now(), type: m.type, text: m.type === 'text' ? m.text : '', messageId: m.id, chatId, chatType });
+  list.push(item);
   buffers.set(userId, list.slice(-40));
+  pendingSave.push(item);
+  if (!saveTimer) saveTimer = setTimeout(flushPending, 2500);
+}
+
+// 寫進試算表「訊息暫存」（只存一對一和設定過的師傅群；廠商群不存）
+let pendingSave = [];
+let saveTimer = null;
+let flushing = null;
+async function flushPending() {
+  saveTimer = null;
+  if (flushing) await flushing;
+  if (!pendingSave.length) return;
+  const batch = pendingSave; pendingSave = [];
+  flushing = (async () => {
+    try {
+      const g = await getGroups();
+      const msgs = [];
+      for (const it of batch) {
+        if (it.chatType !== 'user' && !g.venues[it.chatId]) continue;
+        if (it.type === 'text' && parseCommand(it.text)) continue;
+        const displayName = await displayNameOf(it.userId, it.chatId, it.chatType);
+        msgs.push({ ...it, displayName });
+      }
+      if (msgs.length) await gas('saveMsgs', { msgs });
+    } catch (e) { console.error('saveMsgs error', e.message); }
+  })();
+  await flushing;
+  flushing = null;
+}
+async function chefMessages(userId) {
+  await flushPending();
+  const { msgs } = await gas('getMsgs', { userId, since: Date.now() - LOOKBACK_MS });
+  const seen = new Set(msgs.map(m => m.messageId));
+  for (const it of (buffers.get(userId) || [])) if (!seen.has(it.messageId)) msgs.push(it);
+  return msgs.sort((a, b) => a.ts - b.ts);
+}
+async function recentSenders(chatId) {
+  await flushPending();
+  const { senders } = await gas('recentSenders', { since: Date.now() - LOOKBACK_MS, chatId: chatId || '' });
+  return senders;
 }
 setInterval(() => {
   const cutoff = Date.now() - BUFFER_TTL;
@@ -56,12 +97,14 @@ setInterval(() => {
   for (const [id, d] of drafts) if (Date.now() - d.createdAt > DRAFT_TTL) drafts.delete(id);
 }, 60 * 1000);
 
-function findBufferedMessage(messageId) {
+async function findBufferedMessage(messageId) {
   for (const [uid, list] of buffers) {
     const item = list.find(i => i.messageId === messageId);
     if (item) return { userId: uid, item };
   }
-  return null;
+  await flushPending();
+  const { msg } = await gas('findMsg', { messageId });
+  return msg ? { userId: msg.userId, item: msg } : null;
 }
 
 // ============================================================
@@ -111,6 +154,12 @@ function text(t) { return { type: 'text', text: t }; }
 function pb(label, data) { return { type: 'postback', label: label.slice(0, 20), data, displayText: label.slice(0, 20) }; }
 function parsePb(data) { return Object.fromEntries(new URLSearchParams(data)); }
 function norm(s) { return String(s || '').replace(/[\s\u3000]/g, '').toLowerCase(); }
+function dateLabel(ts) {
+  const d = new Date(ts + 8 * 3600 * 1000);
+  const today = new Date(Date.now() + 8 * 3600 * 1000);
+  const sameDay = d.toISOString().slice(0, 10) === today.toISOString().slice(0, 10);
+  return (sameDay ? '' : d.toISOString().slice(5, 10).replace('-', '/') + ' ') + d.toISOString().slice(11, 16);
+}
 function hhmm(ts) { return new Date(ts + 8 * 3600 * 1000).toISOString().slice(11, 16); }
 async function safePush(to, msgs) {
   try { await client.pushMessage(to, msgs); } catch (e) { console.error('push error', e.originalError?.response?.data || e.message); }
@@ -183,20 +232,12 @@ async function resolveChefByToken(token, ctx) {
   const chefs = await getChefs();
   const c = chefs.find(x => norm(x['姓名']) === t) || chefs.find(x => norm(x['姓名']).includes(t) || t.includes(norm(x['姓名'])));
   if (c) return { userId: c['LINE ID'], name: c['姓名'], venue: c['館別'], registered: true };
-  // 2) 最近有發言的人（同一個群優先）
-  const cutoff = Date.now() - BUFFER_TTL;
-  const candidates = [];
-  for (const [uid, list] of buffers) {
-    const recent = list.filter(i => i.ts >= cutoff && (!ctx.chatId || i.chatId === ctx.chatId || ctx.anyChat));
-    if (!recent.length) continue;
-    const last = recent[recent.length - 1];
-    const dn = await displayNameOf(uid, last.chatId, last.chatType);
-    if (dn && norm(dn).includes(t)) candidates.push({ userId: uid, dn, chatId: last.chatId });
-  }
-  if (!candidates.length) return null;
-  const pick = candidates[0];
-  const parsed = parseDisplayName(pick.dn);
-  return { userId: pick.userId, name: parsed.name, venue: parsed.venue, registered: false, chatId: pick.chatId };
+  // 2) 最近 3 天有傳訊息的人（同一個群優先）
+  const senders = await recentSenders(ctx.anyChat ? '' : ctx.chatId);
+  const hit = senders.find(x => x.displayName && norm(x.displayName).includes(t));
+  if (!hit) return null;
+  const parsed = parseDisplayName(hit.displayName);
+  return { userId: hit.userId, name: parsed.name, venue: parsed.venue, registered: false, chatId: hit.chatId };
 }
 
 async function chefInfoByUserId(userId, chatId, chatType) {
@@ -213,11 +254,17 @@ async function chefInfoByUserId(userId, chatId, chatType) {
 // ============================================================
 async function buildDraft({ chef, vendorToken, descTokens, quoted, byAdmin }) {
   const vendors = await getVendors();
-  const list = buffers.get(chef.userId) || [];
-  let items;
-  if (quoted) items = list.filter(i => i.chatId === quoted.chatId && Math.abs(i.ts - quoted.ts) <= QUOTE_WINDOW_MS);
-  else items = list.filter(i => i.ts >= Date.now() - WINDOW_MS);
-  items.sort((a, b) => a.ts - b.ts);
+  const all = await chefMessages(chef.userId);
+  // 把師傅的訊息依時間切成「一段一段」（間隔超過 15 分鐘就是另一件事）
+  const bursts = [];
+  for (const it of all) {
+    const last = bursts.length ? bursts[bursts.length - 1] : null;
+    if (last && it.chatId === last[0].chatId && it.ts - last[last.length - 1].ts <= BURST_GAP_MS) last.push(it);
+    else bursts.push([it]);
+  }
+  let items = [];
+  if (quoted) items = bursts.find(b => b.some(i => i.messageId === quoted.messageId)) || [];
+  else if (bursts.length) items = bursts[bursts.length - 1]; // 最近的一段
 
   const texts = items.filter(i => i.type === 'text' && !parseCommand(i.text)).map(i => i.text.trim()).filter(Boolean);
   const photos = items.filter(i => i.type === 'image').slice(-MAX_PHOTOS).map(i => ({ messageId: i.messageId, ts: i.ts }));
@@ -252,7 +299,7 @@ async function buildDraft({ chef, vendorToken, descTokens, quoted, byAdmin }) {
 }
 
 function previewFlex(d) {
-  const photoLine = d.photos.length ? d.photos.map((p, i) => `${'①②③④⑤'[i] || (i + 1)}${hhmm(p.ts)}`).join('  ') : '（無）';
+  const photoLine = d.photos.length ? d.photos.map((p, i) => `${'①②③④⑤'[i] || (i + 1)}${dateLabel(p.ts)}`).join('  ') : '（無）';
   const rows = [
     ['師傅', `${d.venue || '館別未知'} ${d.chef.name}`],
     ['廠商', d.vendorUnconfirmed ? `${d.vendor} ⚠ 待確認` : d.vendor],
@@ -360,9 +407,10 @@ async function confirmDraft(draftId, admin) {
   }
   // 下載照片
   const photos = [];
+  let failed = 0;
   for (const p of d.photos) {
     try { photos.push({ base64: await downloadImage(p.messageId), mime: 'image/jpeg' }); }
-    catch (e) { console.error('photo download failed', p.messageId, e.message); }
+    catch (e) { failed++; console.error('photo download failed', p.messageId, e.message); }
   }
   const { case: c, caseId } = await gas('createCase', {
     venue: d.venue, chefName: d.chef.name, chefId: d.chef.userId,
@@ -378,7 +426,9 @@ async function confirmDraft(draftId, admin) {
   if (d.sourceChatType === 'user') await safePush(d.chef.userId, [text(line1)]);
   else if (g.venues[d.sourceChatId]) await safePush(d.sourceChatId, [text(line1)]);
 
-  return [caseFlex(c)];
+  const out = [caseFlex(c)];
+  if (failed) out.push(text(`⚠ 有 ${failed} 張照片已無法從 LINE 取得（放太久），請師傅補傳，採購再到雲端資料夾補上。`));
+  return out;
 }
 
 // ============================================================
@@ -601,6 +651,9 @@ async function handleEvent(ev) {
 // ============================================================
 //  #開單
 // ============================================================
+function venueLabel(chatId) {
+  return cache.groups && cache.groups.venues ? cache.groups.venues[chatId] || '' : '';
+}
 async function openCase(ev, cmd, admin, ctx) {
   const vendors = await getVendors();
   const quotedId = ev.message && ev.message.quotedMessageId;
@@ -609,7 +662,7 @@ async function openCase(ev, cmd, admin, ctx) {
   let tokens = [...cmd.tokens];
 
   if (quotedId) {
-    const found = findBufferedMessage(quotedId);
+    const found = await findBufferedMessage(quotedId);
     if (found) {
       quoted = found.item;
       chef = await chefInfoByUserId(found.userId, found.item.chatId, found.item.chatType);
@@ -626,7 +679,12 @@ async function openCase(ev, cmd, admin, ctx) {
     }
   }
   if (!chef) {
-    return [text('找不到師傅。請確認名字跟他在群裡的顯示名稱一致，且他最近 30 分鐘內有傳訊息；或長按師傅的訊息 →「回覆」再打 #開單 廠商名。')];
+    // 列出最近有傳訊息的人，方便採購照抄名稱
+    const senders = await recentSenders(ctx.anyChat ? '' : ctx.chatId);
+    const listTxt = senders.length
+      ? '\n\n最近有傳訊息的人（照抄名稱即可）：\n' + senders.slice(0, 8).map(r => `・${r.displayName || '(無名稱)'}（${r.chatType === 'user' ? '一對一' : (venueLabel(r.chatId) || '群組')} ${dateLabel(r.ts)}）`).join('\n')
+      : '\n\n最近 3 天沒有任何師傅的訊息。';
+    return [text('找不到師傅「' + (tokens[0] || '') + '」。' + listTxt)];
   }
   if (chefToken) tokens = tokens.filter(t => t !== chefToken);
 
@@ -642,7 +700,7 @@ async function openCase(ev, cmd, admin, ctx) {
   const draft = await buildDraft({ chef, vendorToken, descTokens: tokens, quoted, byAdmin: admin });
   if (!draft.description && !draft.photos.length) {
     drafts.delete(draft.id); lastDraftId = null;
-    return [text(`${chef.name} 最近 10 分鐘沒有可用的訊息或照片，請他再傳一次，或引用他的訊息開單。`)];
+    return [text(`${chef.name} 最近 3 天沒有可用的訊息或照片，請他再傳一次。`)];
   }
   return sendPreview(draft, ctx);
 }
