@@ -234,7 +234,8 @@ async function resolveChefByToken(token, ctx) {
   if (c) return { userId: c['LINE ID'], name: c['姓名'], venue: c['館別'], registered: true };
   // 2) 最近 3 天有傳訊息的人（同一個群優先）
   const senders = await recentSenders(ctx.anyChat ? '' : ctx.chatId);
-  const hit = senders.find(x => x.displayName && norm(x.displayName).includes(t));
+  const nz = x => x.replace(/^0+/, ''); // 手機號碼去掉開頭的 0 再比
+  const hit = senders.find(x => x.displayName && (norm(x.displayName).includes(t) || t.includes(norm(x.displayName)) || nz(norm(x.displayName)) === nz(t)));
   if (!hit) return null;
   const parsed = parseDisplayName(hit.displayName);
   return { userId: hit.userId, name: parsed.name, venue: parsed.venue, registered: false, chatId: hit.chatId };
