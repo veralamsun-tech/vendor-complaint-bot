@@ -34,6 +34,7 @@ const drafts = new Map();      // draftId -> draft
 let lastDraftId = null;
 const ngTimers = new Map();    // userId -> timeout
 const nameCache = new Map();   // chatId:userId -> {name, at}
+const unconfiguredSeen = new Map(); // groupId -> last ts（有訊息但尚未設定館別的群）
 const cache = { vendors: null, vendorsAt: 0, chefs: null, chefsAt: 0, admins: new Map(), groups: null, groupsAt: 0 };
 
 function remember(ev) {
@@ -65,7 +66,10 @@ async function flushPending() {
       const g = await getGroups();
       const msgs = [];
       for (const it of batch) {
-        if (it.chatType !== 'user' && !g.venues[it.chatId]) continue;
+        if (it.chatType !== 'user' && !g.venues[it.chatId]) {
+          if (it.chatId !== g.purchasingGroupId) unconfiguredSeen.set(it.chatId, it.ts);
+          continue;
+        }
         if (it.type === 'text' && parseCommand(it.text)) continue;
         const displayName = await displayNameOf(it.userId, it.chatId, it.chatType);
         msgs.push({ ...it, displayName });
@@ -142,8 +146,8 @@ async function getAdmin(userId) {
 }
 async function getGroups(force) {
   if (!force && cache.groups && Date.now() - cache.groupsAt < CACHE_TTL) return cache.groups;
-  const { groups, purchasingGroupId } = await gas('getGroups');
-  cache.groups = { venues: groups, purchasingGroupId }; cache.groupsAt = Date.now();
+  const { groups, depts, purchasingGroupId } = await gas('getGroups');
+  cache.groups = { venues: groups, depts: depts || {}, purchasingGroupId }; cache.groupsAt = Date.now();
   return cache.groups;
 }
 
@@ -231,7 +235,7 @@ async function resolveChefByToken(token, ctx) {
   // 1) 師傅名單
   const chefs = await getChefs();
   const c = chefs.find(x => norm(x['姓名']) === t) || chefs.find(x => norm(x['姓名']).includes(t) || t.includes(norm(x['姓名'])));
-  if (c) return { userId: c['LINE ID'], name: c['姓名'], venue: c['館別'], registered: true };
+  if (c) return { userId: c['LINE ID'], name: c['姓名'], venue: c['館別'], dept: c['部門'] || '', registered: true };
   // 2) 最近 3 天有傳訊息的人（同一個群優先）
   const senders = await recentSenders(ctx.anyChat ? '' : ctx.chatId);
   const nz = x => x.replace(/^0+/, ''); // 手機號碼去掉開頭的 0 再比
@@ -244,7 +248,7 @@ async function resolveChefByToken(token, ctx) {
 async function chefInfoByUserId(userId, chatId, chatType) {
   const chefs = await getChefs();
   const c = chefs.find(x => x['LINE ID'] === userId);
-  if (c) return { userId, name: c['姓名'], venue: c['館別'], registered: true };
+  if (c) return { userId, name: c['姓名'], venue: c['館別'], dept: c['部門'] || '', registered: true };
   const dn = await displayNameOf(userId, chatId, chatType);
   const parsed = parseDisplayName(dn);
   return { userId, name: parsed.name || '師傅', venue: parsed.venue, registered: false };
@@ -283,14 +287,16 @@ async function buildDraft({ chef, vendorToken, descTokens, quoted, byAdmin }) {
 
   // 館別：師傅名單 > 顯示名稱 > 該群設定
   let venue = chef.venue || '';
-  if (!venue && src && src.chatType === 'group') {
+  let dept = chef.dept || '';
+  if (src && src.chatType === 'group') {
     const g = await getGroups();
-    venue = g.venues[src.chatId] || '';
+    if (!venue) venue = g.venues[src.chatId] || '';
+    if (!dept) dept = g.depts[src.chatId] || '';
   }
 
   const id = String(Date.now()) + Math.random().toString(36).slice(2, 6);
   const draft = {
-    id, createdAt: Date.now(), chef, venue, vendor, vendorUnconfirmed, description, photos,
+    id, createdAt: Date.now(), chef, venue, dept, vendor, vendorUnconfirmed, description, photos,
     sourceChatId: src ? src.chatId : chef.userId, sourceChatType: src ? src.chatType : 'user',
     byAdmin: byAdmin || null,
   };
@@ -302,7 +308,7 @@ async function buildDraft({ chef, vendorToken, descTokens, quoted, byAdmin }) {
 function previewFlex(d) {
   const photoLine = d.photos.length ? d.photos.map((p, i) => `${'①②③④⑤'[i] || (i + 1)}${dateLabel(p.ts)}`).join('  ') : '（無）';
   const rows = [
-    ['師傅', `${d.venue || '館別未知'} ${d.chef.name}`],
+    ['師傅', `${d.venue || '館別未知'}${d.dept ? ' ' + d.dept : ''} ${d.chef.name}`],
     ['廠商', d.vendorUnconfirmed ? `${d.vendor} ⚠ 待確認` : d.vendor],
     ['描述', d.description || '（無文字）'],
     ['照片', photoLine],
@@ -336,7 +342,7 @@ function caseFlex(c, opts = {}) {
   if (c['照片連結']) buttons.push({ type: 'button', style: 'secondary', action: { type: 'uri', label: '查看照片', uri: c['照片連結'] } });
   const lines = [
     { type: 'text', text: `${opts.title || '🔔 新案件'} ${id}`, weight: 'bold', size: 'md', color: BRAND },
-    { type: 'text', text: `${c['館別']}｜${c['師傅']}${c['開單人'] ? '｜開單：' + c['開單人'] : ''}`, size: 'sm', color: '#888888', wrap: true },
+    { type: 'text', text: `${c['館別']}${c['部門'] ? '｜' + c['部門'] : ''}｜${c['師傅']}${c['開單人'] ? '｜開單：' + c['開單人'] : ''}`, size: 'sm', color: '#888888', wrap: true },
     { type: 'text', text: `廠商：${c['廠商']}${c['廠商待確認'] ? '（待確認）' : ''}`, wrap: true },
     { type: 'text', text: `問題：${c['問題描述'] || '—'}`, wrap: true },
     { type: 'text', text: `狀態：${status}${c['負責人'] ? '｜' + c['負責人'] : ''}`, size: 'sm', color: '#888888', wrap: true },
@@ -404,7 +410,7 @@ async function confirmDraft(draftId, admin) {
 
   // 自動登記師傅
   if (!d.chef.registered) {
-    try { await gas('registerChef', { userId: d.chef.userId, name: d.chef.name, venue: d.venue }); cache.chefs = null; } catch (e) { console.error(e); }
+    try { await gas('registerChef', { userId: d.chef.userId, name: d.chef.name, venue: d.venue, dept: d.dept }); cache.chefs = null; } catch (e) { console.error(e); }
   }
   // 下載照片
   const photos = [];
@@ -414,7 +420,7 @@ async function confirmDraft(draftId, admin) {
     catch (e) { failed++; console.error('photo download failed', p.messageId, e.message); }
   }
   const { case: c, caseId } = await gas('createCase', {
-    venue: d.venue, chefName: d.chef.name, chefId: d.chef.userId,
+    venue: d.venue, dept: d.dept, chefName: d.chef.name, chefId: d.chef.userId,
     vendor: d.vendor, vendorUnconfirmed: d.vendorUnconfirmed,
     description: d.description, category: '', photos,
     source: d.sourceChatType === 'user' ? '一對一' : d.sourceChatId,
@@ -559,17 +565,21 @@ async function handleEvent(ev) {
     if (inVenueGroup && cmd.cmd === '開單') return [text('請先在採購群登記：#我是採購 你的名字')];
     return [];
   }
-  // 未設定的群（例如廠商群）：完全不回
-  if (chatType !== 'user' && !isPurchasingGroup && !inVenueGroup && cmd.cmd !== '設定館別') return [];
+  // 未設定的群（例如廠商群）：完全不回；只有採購打 #開單 時提示一句
+  if (chatType !== 'user' && !isPurchasingGroup && !inVenueGroup && cmd.cmd !== '設定館別') {
+    if (cmd.cmd === '開單') return [text('這個群還沒設定館別，機器人不會記錄這裡的訊息。請先在這個群打：#設定館別 大直館／新莊館／士林館，設定後請師傅再傳一次。')];
+    return [];
+  }
 
   if (cmd.cmd === '設定館別') {
     if (chatType === 'user') return [text('請在師傅群裡輸入這個指令。')];
     const v = cmd.tokens.find(t => VENUES.includes(t)) || cmd.tokens.find(t => VENUES.includes(t + '館'));
     if (!v) return [text('格式：#設定館別 大直館／新莊館／士林館')];
     const venue = VENUES.includes(v) ? v : v + '館';
-    await gas('setGroupVenue', { groupId: chatId, venue });
+    const dept = cmd.tokens.filter(t => t !== v).join(' ').trim();
+    await gas('setGroupVenue', { groupId: chatId, venue, dept });
     cache.groups = null;
-    return [text(`✅ 這個群已設定為「${venue}」師傅群。採購在這裡打 #開單 就能建案。`)];
+    return [text(`✅ 這個群已設定為「${venue}${dept ? '／' + dept : ''}」師傅群。採購在這裡打 #開單 就能建案。`)];
   }
 
   if (cmd.cmd === '取消') {
@@ -644,7 +654,7 @@ async function handleEvent(ev) {
     return [text(`🗑 案件 ${id} 已作廢。`)];
   }
   if (cmd.cmd === '說明') {
-    return [text('採購指令：\n#開單 師傅名 廠商名 [補充描述] — 建案（可引用師傅訊息，省略師傅名）\n#刪照片 2 — 預覽時刪掉第 2 張\n#確認 — 確認最新預覽（同按鈕）\n#未結案 — 所有未結案卡片（有按鈕）\n#我的 — 我負責的案件\n#結案 — 從清單挑一件結案\n#結案 師傅名或廠商名 處理結果 — 直接結案\n#廠商 師傅名 正確廠商名 — 修正廠商\n#作廢 — 從清單挑一件作廢\n#設定館別 ○○館 — 在師傅群設定館別\n#設定採購群 — 在採購群設定\n#我是採購 名字 — 登記為採購')];
+    return [text('採購指令：\n#開單 師傅名 廠商名 [補充描述] — 建案（可引用師傅訊息，省略師傅名）\n#刪照片 2 — 預覽時刪掉第 2 張\n#確認 — 確認最新預覽（同按鈕）\n#未結案 — 所有未結案卡片（有按鈕）\n#我的 — 我負責的案件\n#結案 — 從清單挑一件結案\n#結案 師傅名或廠商名 處理結果 — 直接結案\n#廠商 師傅名 正確廠商名 — 修正廠商\n#作廢 — 從清單挑一件作廢\n#設定館別 ○○館 部門 — 在師傅群設定館別與部門\n#設定採購群 — 在採購群設定\n#我是採購 名字 — 登記為採購')];
   }
   return [];
 }
@@ -685,7 +695,10 @@ async function openCase(ev, cmd, admin, ctx) {
     const listTxt = senders.length
       ? '\n\n最近有傳訊息的人（照抄名稱即可）：\n' + senders.slice(0, 8).map(r => `・${r.displayName || '(無名稱)'}（${r.chatType === 'user' ? '一對一' : (venueLabel(r.chatId) || '群組')} ${dateLabel(r.ts)}）`).join('\n')
       : '\n\n最近 3 天沒有任何師傅的訊息。';
-    return [text('找不到師傅「' + (tokens[0] || '') + '」。' + listTxt)];
+    const cutoffU = Date.now() - LOOKBACK_MS;
+    const unconf = [...unconfiguredSeen.entries()].filter(([, ts]) => ts >= cutoffU).length;
+    const hint = unconf ? `\n\n⚠ 另有 ${unconf} 個群組最近有訊息但還沒設定館別，機器人不會記錄那些群。請到該群打「#設定館別 ○○館」。` : '';
+    return [text('找不到師傅「' + (tokens[0] || '') + '」。' + listTxt + hint)];
   }
   if (chefToken) tokens = tokens.filter(t => t !== chefToken);
 
