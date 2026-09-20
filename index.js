@@ -302,7 +302,34 @@ async function buildDraft({ chef, vendorToken, descTokens, quoted, byAdmin }) {
   };
   drafts.set(id, draft);
   lastDraftId = id;
+  await persistDraft(draft);
   return draft;
+}
+async function persistDraft(d) {
+  try { await gas('saveDraft', { id: d.id, json: JSON.stringify(d) }); await gas('setConfig', { key: '最新草稿ID', value: d.id }); }
+  catch (e) { console.error('saveDraft error', e.message); }
+}
+async function loadDraft(id) {
+  if (!id) return null;
+  const m = drafts.get(id);
+  if (m) return m;
+  try {
+    const { json } = await gas('getDraft', { id });
+    if (!json) return null;
+    const d = JSON.parse(json);
+    if (Date.now() - d.createdAt > DRAFT_TTL) return null;
+    drafts.set(id, d);
+    return d;
+  } catch (e) { console.error('getDraft error', e.message); return null; }
+}
+async function latestDraftId() {
+  if (lastDraftId && drafts.has(lastDraftId)) return lastDraftId;
+  try { const { value } = await gas('getConfig', { key: '最新草稿ID' }); return value || null; } catch (e) { return null; }
+}
+async function dropDraft(id) {
+  drafts.delete(id);
+  if (lastDraftId === id) lastDraftId = null;
+  try { await gas('deleteDraft', { id }); } catch (e) {}
 }
 
 function previewFlex(d) {
@@ -403,10 +430,9 @@ async function sendPreview(draft, ctx) {
 //  確認建立
 // ============================================================
 async function confirmDraft(draftId, admin) {
-  const d = drafts.get(draftId);
+  const d = await loadDraft(draftId);
   if (!d) return [text('這張預覽已失效（超過 3 小時或已被處理），請重新 #開單。')];
-  drafts.delete(draftId);
-  if (lastDraftId === draftId) lastDraftId = null;
+  await dropDraft(draftId);
 
   // 自動登記師傅
   if (!d.chef.registered) {
@@ -512,7 +538,7 @@ async function handleEvent(ev) {
     const admin = await getAdmin(userId);
     if (!admin) return [text('請先登記：#我是採購 你的名字')];
     if (pbData.a === 'confirm') return confirmDraft(pbData.d, admin);
-    if (pbData.a === 'discard') { drafts.delete(pbData.d); return [text('已取消這張預覽。')]; }
+    if (pbData.a === 'discard') { await dropDraft(pbData.d); return [text('已取消這張預覽。')]; }
     if (pbData.a === 'take') {
       const r = await gas('takeCase', { caseId: pbData.id, adminName: admin['姓名'] });
       if (r.already) return [text(`案件 ${pbData.id} 已由 ${r.handler} 接手。`)];
@@ -601,25 +627,28 @@ async function handleEvent(ev) {
 
   if (cmd.cmd === '取消') {
     if (drafts.has('closing:' + userId)) { drafts.delete('closing:' + userId); return [text('已取消結案。')]; }
-    if (lastDraftId && drafts.has(lastDraftId)) { drafts.delete(lastDraftId); lastDraftId = null; return [text('已取消預覽。')]; }
+    const lid = await latestDraftId();
+    if (lid && await loadDraft(lid)) { await dropDraft(lid); return [text('已取消預覽。')]; }
     return [];
   }
 
   if (cmd.cmd === '開單') return openCase(ev, cmd, admin, ctx);
 
   if (cmd.cmd === '刪照片') {
-    const d = lastDraftId ? drafts.get(lastDraftId) : null;
+    const d = await loadDraft(await latestDraftId());
     if (!d) return [text('目前沒有待確認的預覽。')];
     const nums = cmd.tokens.join(' ').match(/\d+/g);
     if (!nums) return [text('格式：#刪照片 2（照片編號）')];
     const idx = new Set(nums.map(n => parseInt(n, 10) - 1));
     d.photos = d.photos.filter((p, i) => !idx.has(i));
+    await persistDraft(d);
     return sendPreview(d, ctx);
   }
 
   if (cmd.cmd === '確認') {
-    if (!lastDraftId || !drafts.has(lastDraftId)) return [text('目前沒有待確認的預覽。')];
-    return confirmDraft(lastDraftId, admin);
+    const lid = await latestDraftId();
+    if (!lid || !(await loadDraft(lid))) return [text('目前沒有待確認的預覽。')];
+    return confirmDraft(lid, admin);
   }
 
   if (cmd.cmd === '未結案' || cmd.cmd === '我的') {
@@ -726,11 +755,11 @@ async function openCase(ev, cmd, admin, ctx) {
   if (vendorToken) tokens = tokens.filter(t => t !== vendorToken);
 
   // 若有舊預覽，先丟掉
-  if (lastDraftId && drafts.has(lastDraftId)) drafts.delete(lastDraftId);
+  if (lastDraftId && drafts.has(lastDraftId)) await dropDraft(lastDraftId);
 
   const draft = await buildDraft({ chef, vendorToken, descTokens: tokens, quoted, byAdmin: admin });
   if (!draft.description && !draft.photos.length) {
-    drafts.delete(draft.id); lastDraftId = null;
+    await dropDraft(draft.id);
     return [text(`${chef.name} 最近 3 天沒有可用的訊息或照片，請他再傳一次。`)];
   }
   return sendPreview(draft, ctx);
