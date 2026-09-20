@@ -23,6 +23,20 @@ const DRAFT_TTL = 3 * 60 * 60 * 1000;    // 預覽 3 小時未確認作廢
 const NG_DEBOUNCE_MS = 60 * 1000;        // 師傅打 NG 後等 60 秒再出預覽
 const CACHE_TTL = 10 * 60 * 1000;
 
+const CATEGORIES = [
+  ['品質不良', ['爛', '壞', '不新鮮', '太醜', '醜', '發霉', '霉', '異味', '臭', '撞傷', '傷', '太細', '太粗', '沒去皮', '未去皮', '沒剝皮', '未剝皮', '沒處理', '黃', '軟', '出水', '變色', '品質', '變形', '擠壓', '壓壞', '破', '裂']],
+  ['規格不符', ['太大', '太小', '大小不一', '大小差', '太長', '太短', '太厚', '太薄', '不夠肥', '太瘦', '規格', '形狀', '尺寸', '不依', '不一', '頭小', '不均']],
+  ['數量短少', ['少送', '短少', '少了', '缺', '數量不對', '不夠', '少一', '少兩', '少二', '少三']],
+  ['送錯品項', ['送錯', '錯的', '不是我要', '不對的', '搞錯', '拿錯']],
+  ['逾時送達', ['晚到', '沒送', '遲到', '還沒來', '還沒到', '沒來', '太晚']],
+];
+const CATEGORY_NAMES = CATEGORIES.map(c => c[0]).concat(['其他']);
+function classify(text) {
+  const t = String(text || '');
+  for (const [name, keys] of CATEGORIES) if (keys.some(k => t.includes(k))) return name;
+  return '其他';
+}
+
 const client = new line.Client(config);
 const app = express();
 
@@ -197,7 +211,7 @@ function parseDisplayName(dn) {
 }
 
 // 指令解析：訊息任何位置出現 #指令 都算，其餘文字切成 tokens
-const COMMANDS = ['開單', '刪照片', '取消', '作廢', '未結案', '案件', '結案', '廠商', '說明', '設定採購群', '設定館別', '設定部門', '我是採購', '我的ID', '我的', '確認'];
+const COMMANDS = ['開單', '刪照片', '取消', '作廢', '未結案', '案件', '結案', '廠商', '說明', '設定採購群', '設定館別', '設定部門', '分類', '我是採購', '我的ID', '我的', '確認'];
 function parseCommand(t) {
   if (!t) return null;
   const s = t.replace(/\u3000/g, ' ');
@@ -283,7 +297,10 @@ async function buildDraft({ chef, vendorToken, descTokens, quoted, byAdmin }) {
   }
   if (!vendor) { vendor = vendorToken || '未填'; vendorUnconfirmed = true; }
 
-  const description = descTokens && descTokens.length ? descTokens.join(' ') : texts.join('；');
+  let category = null;
+  descTokens = (descTokens || []).filter(tk => { if (CATEGORY_NAMES.includes(tk)) { category = tk; return false; } return true; });
+  const description = descTokens.length ? descTokens.join(' ') : texts.join('；');
+  if (!category) category = classify(description + ' ' + texts.join(' '));
 
   // 館別：師傅名單 > 顯示名稱 > 該群設定
   let venue = chef.venue || '';
@@ -296,7 +313,7 @@ async function buildDraft({ chef, vendorToken, descTokens, quoted, byAdmin }) {
 
   const id = String(Date.now()) + Math.random().toString(36).slice(2, 6);
   const draft = {
-    id, createdAt: Date.now(), chef, venue, dept, vendor, vendorUnconfirmed, description, photos,
+    id, createdAt: Date.now(), chef, venue, dept, vendor, vendorUnconfirmed, description, category, photos,
     sourceChatId: src ? src.chatId : chef.userId, sourceChatType: src ? src.chatType : 'user',
     byAdmin: byAdmin || null,
   };
@@ -338,6 +355,7 @@ function previewFlex(d) {
     ['師傅', `${d.venue || '館別未知'}${d.dept ? ' ' + d.dept : ''} ${d.chef.name}`],
     ['廠商', d.vendorUnconfirmed ? `${d.vendor} ⚠ 待確認` : d.vendor],
     ['描述', d.description || '（無文字）'],
+    ['分類', d.category || '其他'],
     ['照片', photoLine],
   ];
   return {
@@ -372,6 +390,7 @@ function caseFlex(c, opts = {}) {
     { type: 'text', text: `${c['館別']}${c['部門'] ? '｜' + c['部門'] : ''}｜${c['師傅']}${c['開單人'] ? '｜開單：' + c['開單人'] : ''}`, size: 'sm', color: '#888888', wrap: true },
     { type: 'text', text: `廠商：${c['廠商']}${c['廠商待確認'] ? '（待確認）' : ''}`, wrap: true },
     { type: 'text', text: `問題：${c['問題描述'] || '—'}`, wrap: true },
+    { type: 'text', text: `分類：${c['問題分類'] || '其他'}`, size: 'sm', color: '#888888' },
     { type: 'text', text: `狀態：${status}${c['負責人'] ? '｜' + c['負責人'] : ''}`, size: 'sm', color: '#888888', wrap: true },
   ];
   return {
@@ -448,7 +467,7 @@ async function confirmDraft(draftId, admin) {
   const { case: c, caseId } = await gas('createCase', {
     venue: d.venue, dept: d.dept, chefName: d.chef.name, chefId: d.chef.userId,
     vendor: d.vendor, vendorUnconfirmed: d.vendorUnconfirmed,
-    description: d.description, category: '', photos,
+    description: d.description, category: d.category || classify(d.description), photos,
     source: d.sourceChatType === 'user' ? '一對一' : d.sourceChatId,
     createdBy: admin ? admin['姓名'] : '',
   });
@@ -689,6 +708,15 @@ async function handleEvent(ev) {
     const id = r.case['案件編號'];
     await gas('updateVendor', { caseId: id, vendor: v.join(' '), adminName: admin['姓名'] });
     return [text(`✅ 案件 ${id} 廠商已改為「${v.join(' ')}」`)];
+  }
+  if (cmd.cmd === '分類') {
+    const [key, ...rest] = cmd.tokens;
+    const cat = rest.find(t => CATEGORY_NAMES.includes(t)) || (CATEGORY_NAMES.includes(key) ? key : null);
+    if (!key || !cat) return [text('格式：#分類 師傅名或編號 類別\n類別：' + CATEGORY_NAMES.join('／'))];
+    const r = await resolveOpenCase(key, admin['姓名']);
+    if (!r || r.choices) return [text('找不到唯一的案件，請改用編號。')];
+    await gas('updateCategory', { caseId: r.case['案件編號'], category: cat, adminName: admin['姓名'] });
+    return [text(`✅ 案件 ${r.case['案件編號']} 分類已改為「${cat}」`)];
   }
   if (cmd.cmd === '作廢') {
     const [key, ...reason] = cmd.tokens;
