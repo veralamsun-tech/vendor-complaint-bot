@@ -19,7 +19,7 @@ const MAX_PHOTOS = 5;
 const BURST_GAP_MS = 15 * 60 * 1000;     // 師傅訊息間隔超過 15 分鐘就視為另一件事
 const LOOKBACK_MS = 3 * 24 * 3600 * 1000; // 訊息保存 3 天（存在試算表「訊息暫存」）
 const BUFFER_TTL = 30 * 60 * 1000;       // 記憶體暫存 30 分鐘（試算表才是正本）
-const DRAFT_TTL = 30 * 60 * 1000;        // 預覽 30 分鐘未確認作廢
+const DRAFT_TTL = 3 * 60 * 60 * 1000;    // 預覽 3 小時未確認作廢
 const NG_DEBOUNCE_MS = 60 * 1000;        // 師傅打 NG 後等 60 秒再出預覽
 const CACHE_TTL = 10 * 60 * 1000;
 
@@ -404,7 +404,7 @@ async function sendPreview(draft, ctx) {
 // ============================================================
 async function confirmDraft(draftId, admin) {
   const d = drafts.get(draftId);
-  if (!d) return [text('這張預覽已失效（可能超過 30 分鐘或已被處理），請重新 #開單。')];
+  if (!d) return [text('這張預覽已失效（超過 3 小時或已被處理），請重新 #開單。')];
   drafts.delete(draftId);
   if (lastDraftId === draftId) lastDraftId = null;
 
