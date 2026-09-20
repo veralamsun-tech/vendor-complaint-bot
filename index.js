@@ -197,7 +197,7 @@ function parseDisplayName(dn) {
 }
 
 // 指令解析：訊息任何位置出現 #指令 都算，其餘文字切成 tokens
-const COMMANDS = ['開單', '刪照片', '取消', '作廢', '未結案', '案件', '結案', '廠商', '說明', '設定採購群', '設定館別', '我是採購', '我的ID', '我的', '確認'];
+const COMMANDS = ['開單', '刪照片', '取消', '作廢', '未結案', '案件', '結案', '廠商', '說明', '設定採購群', '設定館別', '設定部門', '我是採購', '我的ID', '我的', '確認'];
 function parseCommand(t) {
   if (!t) return null;
   const s = t.replace(/\u3000/g, ' ');
@@ -442,6 +442,15 @@ async function confirmDraft(draftId, admin) {
 //  Webhook
 // ============================================================
 app.get('/', (req, res) => res.send('vendor-complaint-bot v2 ok'));
+app.get('/health', async (req, res) => {
+  const t0 = Date.now();
+  try {
+    const g = await gas('getGroups');
+    res.json({ ok: true, gas_ms: Date.now() - t0, purchasingGroupId: g.purchasingGroupId, venueGroups: Object.keys(g.groups || {}).length, depts: g.depts || {} });
+  } catch (e) {
+    res.status(500).json({ ok: false, gas_ms: Date.now() - t0, error: String(e.message || e) });
+  }
+});
 app.post('/webhook', line.middleware(config), (req, res) => {
   res.status(200).end();
   handleBatch(req.body.events).catch(err => console.error('batch error', err));
@@ -458,6 +467,8 @@ async function handleBatch(events) {
   for (const evs of groups.values()) {
     const replies = [];
     let replyToken = null;
+    const t0 = Date.now();
+    const chatTo = evs[0].source.groupId || evs[0].source.roomId || evs[0].source.userId;
     for (const ev of evs) {
       try {
         const out = await handleEvent(ev);
@@ -468,9 +479,14 @@ async function handleBatch(events) {
         replies.push(text('系統發生錯誤：' + (e.message || '').slice(0, 80)));
       }
     }
-    if (replyToken && replies.length) {
-      try { await client.replyMessage(replyToken, replies.slice(-5)); }
-      catch (e) { console.error('reply error', e.originalError?.response?.data || e.message); }
+    if (replies.length) {
+      const msgs = replies.slice(-5);
+      const tooSlow = Date.now() - t0 > 25000;
+      if (replyToken && !tooSlow) {
+        try { await client.replyMessage(replyToken, msgs); continue; }
+        catch (e) { console.error('reply error, fallback to push', e.originalError?.response?.data || e.message); }
+      } else if (tooSlow) console.warn('slow handling', Date.now() - t0, 'ms → push');
+      if (chatTo) await safePush(chatTo, msgs);
     }
   }
 }
@@ -562,10 +578,11 @@ async function handleEvent(ev) {
   if (!admin) {
     if (cmd.cmd === '取消') return [];
     if (isPurchasingGroup || chatType === 'user') return [text('請先在採購群登記：#我是採購 你的名字')];
-    if (inVenueGroup && cmd.cmd === '開單') return [text('請先在採購群登記：#我是採購 你的名字')];
+    if (cmd.cmd === '開單' || cmd.cmd === '設定館別' || cmd.cmd === '設定部門') return [text('請先在採購群登記：#我是採購 你的名字，登記後再打一次。')];
     return [];
   }
   // 未設定的群（例如廠商群）：完全不回；只有採購打 #開單 時提示一句
+  if (cmd.cmd === '設定部門') cmd.cmd = '設定館別';
   if (chatType !== 'user' && !isPurchasingGroup && !inVenueGroup && cmd.cmd !== '設定館別') {
     if (cmd.cmd === '開單') return [text('這個群還沒設定館別，機器人不會記錄這裡的訊息。請先在這個群打：#設定館別 大直館／新莊館／士林館，設定後請師傅再傳一次。')];
     return [];
