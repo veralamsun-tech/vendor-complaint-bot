@@ -63,7 +63,7 @@ function remember(ev) {
   list.push(item);
   buffers.set(userId, list.slice(-40));
   pendingSave.push(item);
-  if (!saveTimer) saveTimer = setTimeout(flushPending, 2500);
+  if (!saveTimer) saveTimer = setTimeout(flushPending, 8000);
 }
 
 // 寫進試算表「訊息暫存」（只存一對一和設定過的師傅群；廠商群不存）
@@ -128,16 +128,24 @@ async function findBufferedMessage(messageId) {
 // ============================================================
 //  Google Apps Script
 // ============================================================
-async function gas(action, data) {
-  const r = await fetch(GAS_URL, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ key: GAS_KEY, action, data: data || {} }),
-    redirect: 'follow',
-  });
-  const j = await r.json();
-  if (!j.ok) throw new Error(j.error || 'GAS error');
-  return j;
+async function gas(action, data, retry = 1) {
+  try {
+    const r = await fetch(GAS_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ key: GAS_KEY, action, data: data || {} }),
+      redirect: 'follow',
+    });
+    const txt = await r.text();
+    let j;
+    try { j = JSON.parse(txt); }
+    catch (e) { throw new Error('試算表暫時無法回應（' + (txt.includes('<!DOCTYPE') ? 'Google 回傳網頁而非資料，通常是同時執行過多或需要重新授權' : '格式錯誤') + '）'); }
+    if (!j.ok) throw new Error(j.error || 'GAS error');
+    return j;
+  } catch (e) {
+    if (retry > 0) { await new Promise(r => setTimeout(r, 1500)); return gas(action, data, retry - 1); }
+    throw e;
+  }
 }
 async function getVendors(force) {
   if (!force && cache.vendors && Date.now() - cache.vendorsAt < CACHE_TTL) return cache.vendors;
@@ -160,10 +168,18 @@ async function getAdmin(userId) {
 }
 async function getGroups(force) {
   if (!force && cache.groups && Date.now() - cache.groupsAt < CACHE_TTL) return cache.groups;
-  const { groups, depts, purchasingGroupId } = await gas('getGroups');
-  cache.groups = { venues: groups, depts: depts || {}, purchasingGroupId }; cache.groupsAt = Date.now();
+  try {
+    const { groups, depts, purchasingGroupId } = await gas('getGroups');
+    cache.groups = { venues: groups, depts: depts || {}, purchasingGroupId }; cache.groupsAt = Date.now();
+  } catch (e) {
+    console.error('getGroups failed, using cached', e.message);
+    if (!cache.groups) throw e;
+    cache.groupsAt = Date.now() - CACHE_TTL + 60 * 1000; // 1 分鐘後再試
+  }
   return cache.groups;
 }
+// 只用快取，不打試算表（給一般訊息用）
+function groupsCached() { return cache.groups || { venues: {}, depts: {}, purchasingGroupId: '' }; }
 
 // ============================================================
 //  小工具
@@ -521,7 +537,13 @@ async function handleBatch(events) {
         if (ev.replyToken) replyToken = ev.replyToken;
       } catch (e) {
         console.error('event error', e);
-        replies.push(text('系統發生錯誤：' + (e.message || '').slice(0, 80)));
+        // 錯誤只回給採購群或採購本人，其他地方一律靜默
+        const gc = groupsCached();
+        const src = ev.source;
+        const isPg = src.groupId && src.groupId === gc.purchasingGroupId;
+        let isAdmin1on1 = false;
+        if (!isPg && src.type === 'user') { const c = cache.admins.get(src.userId); isAdmin1on1 = !!(c && c.v); }
+        if (isPg || isAdmin1on1) replies.push(text('⚠ 系統暫時發生錯誤：' + (e.message || '').slice(0, 120) + '\n請稍後再試一次。'));
       }
     }
     if (replies.length) {
@@ -545,7 +567,10 @@ async function handleEvent(ev) {
   const msgText = ev.type === 'message' && ev.message.type === 'text' ? ev.message.text : null;
   const pbData = ev.type === 'postback' ? parsePb(ev.postback.data) : null;
 
-  const g = await getGroups();
+  const cmdEarly = msgText ? parseCommand(msgText) : null;
+  const needsGroups = !!pbData || !!cmdEarly || (msgText && isNgMessage(msgText));
+  // 一般聊天：不查試算表，只用快取判斷（沒快取就當不相干）
+  const g = needsGroups ? await getGroups() : groupsCached();
   const isPurchasingGroup = chatType !== 'user' && chatId === g.purchasingGroupId;
   const venueOfGroup = chatType !== 'user' ? (g.venues[chatId] || '') : '';
   const inVenueGroup = !!venueOfGroup;
@@ -580,7 +605,7 @@ async function handleEvent(ev) {
     return [];
   }
 
-  const cmd = parseCommand(msgText);
+  const cmd = cmdEarly;
 
   // ---- 師傅打 NG 開頭（一對一或師傅群）→ 60 秒後自動出預覽到採購群 ----
   if (!cmd && isNgMessage(msgText) && (chatType === 'user' || inVenueGroup)) {
