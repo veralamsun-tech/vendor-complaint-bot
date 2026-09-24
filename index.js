@@ -63,7 +63,7 @@ function remember(ev) {
   list.push(item);
   buffers.set(userId, list.slice(-40));
   pendingSave.push(item);
-  if (!saveTimer) saveTimer = setTimeout(flushPending, 8000);
+  if (!saveTimer) saveTimer = setTimeout(flushPending, 30000);
 }
 
 // 寫進試算表「訊息暫存」（只存一對一和設定過的師傅群；廠商群不存）
@@ -128,7 +128,7 @@ async function findBufferedMessage(messageId) {
 // ============================================================
 //  Google Apps Script
 // ============================================================
-async function gas(action, data, retry = 1) {
+async function gas(action, data, retry = 3) {
   try {
     const r = await fetch(GAS_URL, {
       method: 'POST',
@@ -143,7 +143,7 @@ async function gas(action, data, retry = 1) {
     if (!j.ok) throw new Error(j.error || 'GAS error');
     return j;
   } catch (e) {
-    if (retry > 0) { await new Promise(r => setTimeout(r, 1500)); return gas(action, data, retry - 1); }
+    if (retry > 0) { await new Promise(r => setTimeout(r, (4 - retry) * 2000)); return gas(action, data, retry - 1); }
     throw e;
   }
 }
